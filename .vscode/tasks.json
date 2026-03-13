@@ -17,8 +17,8 @@
     {
       "label": "Build",
       "type": "shell",
-      "command": "npx",
-      "args": ["tsc"],
+      "command": "npm",
+      "args": ["run", "build"],
       "group": "build",
       "presentation": {
         "reveal": "silent"
