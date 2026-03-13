@@ -5,7 +5,7 @@
       "label": "Worktree: Pick Repository",
       "type": "shell",
       "command": "node",
-      "args": ["${workspaceFolder}/dist/cli/pick-repo.js"],
+      "args": ["${workspaceFolder}/dist/cli/pick-repo.js", "${input:worktreeName}"],
       "presentation": {
         "reveal": "always",
         "panel": "new",
@@ -24,6 +24,13 @@
         "reveal": "silent"
       },
       "problemMatcher": ["$tsc"]
+    }
+  ],
+  "inputs": [
+    {
+      "id": "worktreeName",
+      "type": "promptString",
+      "description": "Worktree name"
     }
   ]
 }
