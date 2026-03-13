@@ -4,6 +4,9 @@
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "bin": {
+    "wt-pick-repo": "dist/cli/pick-repo.js"
+  },
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",

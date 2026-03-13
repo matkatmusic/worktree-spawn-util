@@ -1,0 +1,29 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Worktree: Pick Repository",
+      "type": "shell",
+      "command": "node",
+      "args": ["${workspaceFolder}/dist/cli/pick-repo.js"],
+      "presentation": {
+        "reveal": "always",
+        "panel": "new",
+        "focus": true
+      },
+      "problemMatcher": [],
+      "dependsOn": ["Build"]
+    },
+    {
+      "label": "Build",
+      "type": "shell",
+      "command": "npx",
+      "args": ["tsc"],
+      "group": "build",
+      "presentation": {
+        "reveal": "silent"
+      },
+      "problemMatcher": ["$tsc"]
+    }
+  ]
+}
