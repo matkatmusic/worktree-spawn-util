@@ -51,30 +51,84 @@ export function launchIde(config: IdeConfig, worktreePath: string): void {
   console.log(`[ide] Opened ${config.command} at ${worktreePath}`);
 }
 
-const LAUNCH_CLAUDE_TASK = {
-  label: "Launch Claude",
-  type: "shell",
-  command: "claude --permission-mode plan",
-  runOptions: { runOn: "folderOpen" },
-  presentation: { reveal: "always", focus: true },
-  problemMatcher: [] as string[],
-};
-
 export type TasksFileStatus = "created" | "updated" | "unchanged";
 
+interface Task {
+  label: string;
+  type: string;
+  command: string;
+  runOptions: { runOn: string };
+  presentation: { reveal: string; panel: string; group: string; focus: boolean };
+  isBackground: boolean;
+  problemMatcher: string[];
+}
+
+interface TasksJsonFile {
+  version: string;
+  tasks: Task[];
+}
+
+function addClaudeTask(existing: TasksJsonFile, worktreeName: string): Task[] {
+  const tasks = Array.isArray(existing.tasks) ? existing.tasks : [];
+  if (tasks.some((t) => t.label === "Launch Claude")) {
+    console.log(`[ide] "Launch Claude" task already exists in tasks.json`);
+    return tasks;
+  }
+
+  const claudeTask: Task = {
+    label: "Launch Claude",
+    type: "shell",
+    command: "claude --permission-mode plan",
+    runOptions: { runOn: "folderOpen" },
+    presentation: { reveal: "always", panel: "dedicated", group: `worktree-${worktreeName}`, focus: true },
+    isBackground: true,
+    problemMatcher: [],
+  };
+
+  tasks.push(claudeTask);
+  return tasks;
+}
+
+function addTmuxTask(existing: TasksJsonFile, worktreeName: string): Task[] {
+  const tasks = Array.isArray(existing.tasks) ? existing.tasks : [];
+  const tmuxLabel = `tmux: ${worktreeName}`;
+  if (tasks.some((t) => t.label === tmuxLabel)) {
+    console.log(`[ide] "${tmuxLabel}" task already exists in tasks.json`);
+    return tasks;
+  }
+
+  const tmuxTask: Task = {
+    label: tmuxLabel,
+    type: "shell",
+    command: `tmux new-session -A -s ${worktreeName}`,
+    runOptions: { runOn: "folderOpen" },
+    presentation: { reveal: "always", panel: "dedicated", group: `worktree-${worktreeName}`, focus: false },
+    isBackground: true,
+    problemMatcher: [],
+  };
+
+  tasks.push(tmuxTask);
+  return tasks;
+}
+
+async function writeUpdatedTasks(tasksJson: TasksJsonFile, tasksPath: string): Promise<void> {
+  await writeFile(tasksPath, JSON.stringify(tasksJson, null, 2) + "\n");
+  console.log(`[ide] Updated tasks.json`);
+}
+
 /**
- * Ensure a "Launch Claude" task exists in the worktree's .vscode/tasks.json.
- * Creates the file if missing, or merges the task into an existing file.
+ * Ensure "Launch Claude" and tmux tasks exist in the worktree's .vscode/tasks.json.
+ * Creates the file if missing, or merges tasks into an existing file.
  */
 export async function writeWorktreeTasksFile(
   worktreePath: string,
-  _worktreeName: string,
+  worktreeName: string,
 ): Promise<TasksFileStatus> {
   const tasksPath = join(worktreePath, ".vscode", "tasks.json");
 
   // Try to read existing tasks.json
-  let existing: { version?: string; tasks?: { label?: string }[] } | null =
-    null;
+  let existing: TasksJsonFile | null = null;
+
   try {
     const raw = await readFile(tasksPath, "utf-8");
     existing = JSON.parse(raw);
@@ -83,24 +137,27 @@ export async function writeWorktreeTasksFile(
   }
 
   if (existing) {
-    const tasks = Array.isArray(existing.tasks) ? existing.tasks : [];
-    if (tasks.some((t) => t.label === "Launch Claude")) {
-      console.log(`[ide] "Launch Claude" task already exists in tasks.json`);
+    const originalLength = Array.isArray(existing.tasks) ? existing.tasks.length : 0;
+    existing.tasks = addClaudeTask(existing, worktreeName);
+    existing.tasks = addTmuxTask(existing, worktreeName);
+
+    if (existing.tasks.length === originalLength) {
       return "unchanged";
     }
-    tasks.push(LAUNCH_CLAUDE_TASK);
-    existing.tasks = tasks;
-    await writeFile(tasksPath, JSON.stringify(existing, null, 2) + "\n");
-    console.log(`[ide] Added "Launch Claude" task to existing tasks.json`);
+
+    await writeUpdatedTasks(existing, tasksPath);
     return "updated";
   } else {
-    const tasksJson = {
+    const tasksJson: TasksJsonFile = {
       version: "2.0.0",
-      tasks: [LAUNCH_CLAUDE_TASK],
+      tasks: [],
     };
+
+    tasksJson.tasks = addClaudeTask(tasksJson, worktreeName);
+    tasksJson.tasks = addTmuxTask(tasksJson, worktreeName);
+
     await mkdir(join(worktreePath, ".vscode"), { recursive: true });
-    await writeFile(tasksPath, JSON.stringify(tasksJson, null, 2) + "\n");
-    console.log(`[ide] Created .vscode/tasks.json with "Launch Claude" task`);
+    await writeUpdatedTasks(tasksJson, tasksPath);
     return "created";
   }
 }
@@ -132,4 +189,3 @@ export async function reloadIdeWindow(bundleId: string): Promise<void> {
     );
   }
 }
-

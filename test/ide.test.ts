@@ -118,7 +118,7 @@ describe("writeWorktreeTasksFile", () => {
     await rm(tmpDir, { recursive: true, force: true });
   });
 
-  it("returns 'created' when file is missing", async () => {
+  it("returns 'created' with both Claude and tmux tasks", async () => {
     const status = await writeWorktreeTasksFile(tmpDir, "my-feature");
     expect(status).toBe("created");
 
@@ -129,9 +129,25 @@ describe("writeWorktreeTasksFile", () => {
     const parsed = JSON.parse(content);
 
     expect(parsed.version).toBe("2.0.0");
-    expect(parsed.tasks).toHaveLength(1);
+    expect(parsed.tasks).toHaveLength(2);
     expect(parsed.tasks[0].label).toBe("Launch Claude");
     expect(parsed.tasks[0].runOptions.runOn).toBe("folderOpen");
+    expect(parsed.tasks[0].isBackground).toBe(true);
+    expect(parsed.tasks[1].label).toBe("tmux: my-feature");
+    expect(parsed.tasks[1].command).toBe("tmux new-session -A -s my-feature");
+  });
+
+  it("interpolates worktree name into group fields", async () => {
+    await writeWorktreeTasksFile(tmpDir, "my-feature");
+
+    const content = await readFile(
+      join(tmpDir, ".vscode", "tasks.json"),
+      "utf-8",
+    );
+    const parsed = JSON.parse(content);
+
+    expect(parsed.tasks[0].presentation.group).toBe("worktree-my-feature");
+    expect(parsed.tasks[1].presentation.group).toBe("worktree-my-feature");
   });
 
   it("returns 'updated' and preserves existing tasks", async () => {
@@ -154,16 +170,18 @@ describe("writeWorktreeTasksFile", () => {
     );
     const parsed = JSON.parse(content);
 
-    expect(parsed.tasks).toHaveLength(2);
+    expect(parsed.tasks).toHaveLength(3);
     expect(parsed.tasks[0].label).toBe("Build");
     expect(parsed.tasks[1].label).toBe("Launch Claude");
+    expect(parsed.tasks[2].label).toBe("tmux: my-feature");
   });
 
-  it("returns 'unchanged' if Launch Claude task already exists", async () => {
+  it("returns 'unchanged' if both tasks already exist", async () => {
     const existing = {
       version: "2.0.0",
       tasks: [
         { label: "Launch Claude", type: "shell", command: "claude" },
+        { label: "tmux: my-feature", type: "shell", command: "tmux new-session -A -s my-feature" },
       ],
     };
     await mkdir(join(tmpDir, ".vscode"), { recursive: true });
@@ -180,7 +198,6 @@ describe("writeWorktreeTasksFile", () => {
       join(tmpDir, ".vscode", "tasks.json"),
       "utf-8",
     );
-    // File should be untouched
     expect(content).toBe(originalContent);
   });
 });
