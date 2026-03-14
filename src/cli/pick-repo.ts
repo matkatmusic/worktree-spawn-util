@@ -6,7 +6,7 @@ import { join } from "node:path";
 import * as readline from "node:readline/promises";
 import { promisify } from "node:util";
 import { validateRepo, createWorktree } from "../git/index.js";
-import { detectIde, launchIde } from "../ide/index.js";
+import { detectIde, launchIde, writeWorktreeTasksFile } from "../ide/index.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -84,6 +84,9 @@ try {
   console.error(`[pick-repo] Failed to create worktree: ${message}`);
   process.exit(1);
 }
+
+// --- Set up worktree IDE config ---
+await writeWorktreeTasksFile(worktreePath, worktreeName);
 
 // --- Open IDE window ---
 const ide = detectIde();
