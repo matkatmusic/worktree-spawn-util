@@ -1,0 +1,45 @@
+## Debate Topic: Daemon Port Discovery for Worktree Heartbeat System
+
+### Context
+
+A developer tool manages git worktrees. When a worktree IDE window is opened, a background task inside that window sends HTTP POST requests every 5 seconds to a daemon running on localhost, telling the daemon "I'm still alive." When the IDE window is closed, the terminal running that task is destroyed, the POST requests stop, and the daemon — having received no heartbeat for 15 seconds — concludes the window was closed and triggers cleanup.
+
+The daemon listens on a dynamic port assigned by the OS (port 0, to avoid conflicts). That port number must be baked into the curl command inside the worktree's `.vscode/tasks.json` at generation time. If the daemon was started by a previous invocation, the current invocation needs to discover what port the daemon is listening on so it can write the correct curl URL into the new worktree's tasks.json.
+
+**Constraint:** The solution must NOT write the port to a file inside the repository.
+
+The daemon and CLI are written in TypeScript/Node.js. Primary platform is macOS, secondary is Linux.
+
+### Your Task
+
+Argue for the BEST approach to solve this port discovery problem. Consider and evaluate these categories:
+
+1. **Unix Domain Socket** — Daemon listens on a well-known socket path (e.g., `$TMPDIR/worktree-daemon.sock`). New invocations connect to the socket and query for the TCP port. Eliminates port discovery if used as primary transport.
+
+2. **Port file outside the repo** — Write `{ pid, port, startedAt }` to a well-known path like `os.tmpdir()/worktree-daemon/daemon.json`. Validate staleness via PID check and port probe.
+
+3. **Hash-based deterministic port** — Both daemon and client compute the same port from a hash of stable inputs (username + repo path), mapped to range 49152-65535. Increment on collision.
+
+4. **OS process table inspection** — Use `lsof -iTCP -sTCP:LISTEN -P -n -p <PID>` to discover the port from the daemon's PID. Requires knowing the PID first.
+
+5. **Fixed port with sequential probing** — Start at a known default port (e.g., 19876), try to bind. Client tries the same sequence. Identity verified via health endpoint.
+
+6. **Any other approach you think is superior.**
+
+### Evaluation Criteria
+
+For each approach, evaluate:
+- **Implementation complexity** (lines of code, dependencies)
+- **Reliability** (crash recovery, stale state, race conditions)
+- **Cross-platform support** (macOS + Linux)
+- **Multi-daemon support** (multiple repos with independent daemons)
+- **Security** (localhost binding, no unintended exposure)
+- **Developer experience** (debuggability, transparency)
+- **Industry precedent** (what do similar tools do?)
+
+### Deliverable
+
+1. Rank all approaches from best to worst with justification.
+2. Identify the single best approach and explain why.
+3. Identify any hybrid approaches that combine the strengths of multiple options.
+4. Flag any pitfalls or edge cases that the implementer must handle.

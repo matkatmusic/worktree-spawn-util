@@ -1,0 +1,46 @@
+## Research Task: Daemon Port Discovery for Worktree Heartbeat System
+
+### Context
+
+A developer tool manages git worktrees. The architecture:
+
+1. A CLI (`pick-repo.ts`) creates a git worktree and generates a `.vscode/tasks.json` file
+2. When the IDE opens the worktree, a background task runs a curl command every 5 seconds: `curl -X POST http://localhost:<PORT>/heartbeat/<worktree-name>`
+3. A daemon process receives these heartbeats. If no heartbeat arrives for 15 seconds, the daemon concludes the IDE window was closed and triggers cleanup (deleting the worktree, killing tmux sessions, etc.)
+4. The daemon listens on a dynamic port (port 0) assigned by the OS to avoid conflicts
+5. The port must be known at tasks.json generation time so the curl URL is correct
+
+**The Problem:** If the daemon was already started by a previous `pick-repo.ts` invocation, a new invocation needs to discover the daemon's port to write the correct curl URL into the new worktree's tasks.json.
+
+**Constraint:** The solution must NOT write the port to a file inside the git repository.
+
+**Stack:** TypeScript/Node.js. Primary platform: macOS. Secondary: Linux.
+
+### Research Questions
+
+1. What are ALL viable approaches to share a dynamically assigned port between independent process invocations without a file in the repo?
+
+2. For each approach, evaluate:
+   - Implementation complexity (lines of code, dependencies needed)
+   - Reliability (crash recovery, stale state handling, race conditions)
+   - Cross-platform support (macOS + Linux)
+   - Multi-daemon support (multiple repos with independent daemons running simultaneously)
+   - Security (localhost binding, no unintended network exposure)
+   - Developer experience (debuggability, transparency, ease of troubleshooting)
+   - Industry precedent (what do similar tools like tmux, Docker, Chrome DevTools, PostgreSQL do?)
+
+3. What is the single best approach and why?
+
+4. Are there hybrid approaches that combine strengths of multiple options?
+
+5. What pitfalls and edge cases must the implementer handle?
+
+### Approaches to Consider (non-exhaustive)
+
+- Unix domain socket at a well-known path
+- Port/PID file outside the repo (tmpdir, ~/.config, XDG dirs)
+- Hash-based deterministic port derivation
+- OS process table inspection (lsof/ss)
+- Fixed port with sequential probing
+- Process argument inspection (ps)
+- Any other approach you think is viable

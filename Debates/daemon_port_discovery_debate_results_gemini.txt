@@ -1,0 +1,193 @@
+Debugger listening on ws://127.0.0.1:53730/c6e73a50-5bc8-4f29-a36f-05b8db6e87e9
+For help, see: https://nodejs.org/en/docs/inspector
+Debugger attached.
+Debugger listening on ws://127.0.0.1:53747/5898aa10-9a2c-4a81-95c8-a10aa02731b0
+For help, see: https://nodejs.org/en/docs/inspector
+Debugger attached.
+Loaded cached credentials.
+Attempt 1 failed with status 429. Retrying with backoff... GaxiosError: [{
+  "error": {
+    "code": 429,
+    "message": "No capacity available for model gemini-3.1-pro-preview on the server",
+    "errors": [
+      {
+        "message": "No capacity available for model gemini-3.1-pro-preview on the server",
+        "domain": "global",
+        "reason": "rateLimitExceeded"
+      }
+    ],
+    "status": "RESOURCE_EXHAUSTED",
+    "details": [
+      {
+        "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+        "reason": "MODEL_CAPACITY_EXHAUSTED",
+        "domain": "cloudcode-pa.googleapis.com",
+        "metadata": {
+          "model": "gemini-3.1-pro-preview"
+        }
+      }
+    ]
+  }
+}
+]
+    at Gaxios._request (/opt/homebrew/lib/node_modules/@google/gemini-cli/node_modules/gaxios/build/src/gaxios.js:142:23)
+    at process.processTicksAndRejections (node:internal/process/task_queues:105:5)
+    at async OAuth2Client.requestAsync (/opt/homebrew/lib/node_modules/@google/gemini-cli/node_modules/google-auth-library/build/src/auth/oauth2client.js:429:18)
+    at async CodeAssistServer.requestStreamingPost (file:///opt/homebrew/lib/node_modules/@google/gemini-cli/node_modules/@google/gemini-cli-core/dist/src/code_assist/server.js:261:21)
+    at async CodeAssistServer.generateContentStream (file:///opt/homebrew/lib/node_modules/@google/gemini-cli/node_modules/@google/gemini-cli-core/dist/src/code_assist/server.js:53:27)
+    at async file:///opt/homebrew/lib/node_modules/@google/gemini-cli/node_modules/@google/gemini-cli-core/dist/src/core/loggingContentGenerator.js:285:26
+    at async file:///opt/homebrew/lib/node_modules/@google/gemini-cli/node_modules/@google/gemini-cli-core/dist/src/telemetry/trace.js:81:20
+    at async retryWithBackoff (file:///opt/homebrew/lib/node_modules/@google/gemini-cli/node_modules/@google/gemini-cli-core/dist/src/utils/retry.js:130:28)
+    at async GeminiChat.makeApiCallAndProcessStream (file:///opt/homebrew/lib/node_modules/@google/gemini-cli/node_modules/@google/gemini-cli-core/dist/src/core/geminiChat.js:445:32)
+    at async GeminiChat.streamWithRetries (file:///opt/homebrew/lib/node_modules/@google/gemini-cli/node_modules/@google/gemini-cli-core/dist/src/core/geminiChat.js:265:40) {
+  config: {
+    url: 'https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse',
+    method: 'POST',
+    params: { alt: 'sse' },
+    headers: {
+      'Content-Type': 'application/json',
+      'User-Agent': 'GeminiCLI/0.33.0/gemini-3.1-pro-preview (darwin; arm64) google-api-nodejs-client/9.15.1',
+      Authorization: '<<REDACTED> - See `errorRedactor` option in `gaxios` for configuration>.',
+      'x-goog-api-client': 'gl-node/23.9.0'
+    },
+    responseType: 'stream',
+    body: '<<REDACTED> - See `errorRedactor` option in `gaxios` for configuration>.',
+    signal: AbortSignal { aborted: false },
+    retry: false,
+    paramsSerializer: [Function: paramsSerializer],
+    validateStatus: [Function: validateStatus],
+    errorRedactor: [Function: defaultErrorRedactor]
+  },
+  response: {
+    config: {
+      url: 'https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse',
+      method: 'POST',
+      params: [Object],
+      headers: [Object],
+      responseType: 'stream',
+      body: '<<REDACTED> - See `errorRedactor` option in `gaxios` for configuration>.',
+      signal: [AbortSignal],
+      retry: false,
+      paramsSerializer: [Function: paramsSerializer],
+      validateStatus: [Function: validateStatus],
+      errorRedactor: [Function: defaultErrorRedactor]
+    },
+    data: '[{\n' +
+      '  "error": {\n' +
+      '    "code": 429,\n' +
+      '    "message": "No capacity available for model gemini-3.1-pro-preview on the server",\n' +
+      '    "errors": [\n' +
+      '      {\n' +
+      '        "message": "No capacity available for model gemini-3.1-pro-preview on the server",\n' +
+      '        "domain": "global",\n' +
+      '        "reason": "rateLimitExceeded"\n' +
+      '      }\n' +
+      '    ],\n' +
+      '    "status": "RESOURCE_EXHAUSTED",\n' +
+      '    "details": [\n' +
+      '      {\n' +
+      '        "@type": "type.googleapis.com/google.rpc.ErrorInfo",\n' +
+      '        "reason": "MODEL_CAPACITY_EXHAUSTED",\n' +
+      '        "domain": "cloudcode-pa.googleapis.com",\n' +
+      '        "metadata": {\n' +
+      '          "model": "gemini-3.1-pro-preview"\n' +
+      '        }\n' +
+      '      }\n' +
+      '    ]\n' +
+      '  }\n' +
+      '}\n' +
+      ']',
+    headers: {
+      'alt-svc': 'h3=":443"; ma=2592000,h3-29=":443"; ma=2592000',
+      'content-length': '630',
+      'content-type': 'application/json; charset=UTF-8',
+      date: 'Sat, 14 Mar 2026 08:31:26 GMT',
+      server: 'ESF',
+      'server-timing': 'gfet4t7; dur=6789',
+      vary: 'Origin, X-Origin, Referer',
+      'x-cloudaicompanion-trace-id': '71ea8b4b9d143615',
+      'x-content-type-options': 'nosniff',
+      'x-frame-options': 'SAMEORIGIN',
+      'x-xss-protection': '0'
+    },
+    status: 429,
+    statusText: 'Too Many Requests',
+    request: {
+      responseURL: 'https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse'
+    }
+  },
+  error: undefined,
+  status: 429,
+  [Symbol(gaxios-gaxios-error)]: '6.7.1'
+}
+Here is an evaluation and ranking of the approaches for the daemon port discovery problem, tailored to your specific constraints (Node.js/TypeScript, macOS primary, Linux secondary, multi-daemon support, and background curl heartbeats).
+
+### 1. Ranking of Approaches (Best to Worst)
+
+**#1: Port file outside the repo (e.g., `os.tmpdir()` or `~/.config/`)**
+*   **Justification:** Hits the sweet spot of simplicity, reliability, and developer experience. By writing a state file containing `{ pid, port, path }` to a well-known, user-specific location, the CLI can instantly map a repository path to its daemon.
+*   **Pros:** Fast lookups, O(1) complexity to find the port, standard HTTP debugging (browser/Postman), no cross-platform compatibility issues, perfect multi-daemon support.
+*   **Cons:** Vulnerable to stale state (crashes leaving old files behind), requiring a PID check and health probe to validate.
+
+**#2: Unix Domain Socket**
+*   **Justification:** Completely sidesteps the "port discovery" problem by replacing TCP with file system sockets. The socket path implicitly acts as both the discovery mechanism and the transport layer.
+*   **Pros:** Highly secure (file permissions govern access), zero risk of port collisions, natively supports multi-daemon architectures. `curl` supports it out of the box (`--unix-socket`).
+*   **Cons:** Stale socket cleanup requires careful `EADDRINUSE` handling. **Crucially for macOS**, socket paths have a strict 104-character limit. Because macOS `os.tmpdir()` paths are notoriously long (e.g., `/var/folders/xx/.../T/`), appending a hash can easily exceed this limit, forcing you to use fixed paths like `/tmp/`.
+
+**#3: Fixed port with sequential probing**
+*   **Justification:** A solid, collision-resistant approach common in web development (e.g., React/Vite dev servers). The CLI probes a range (e.g., 19876-19886) hitting a `/health` endpoint until it finds the daemon serving the requested repository path.
+*   **Pros:** No state files to manage, no stale file cleanup needed.
+*   **Cons:** Startup penalty. If a user has 5 worktrees open, the 6th invocation might need to make 5 HTTP requests before finding the correct daemon. Requires the CLI to iterate and wait on network timeouts if unrelated apps hold those ports.
+
+**#4: Hash-based deterministic port**
+*   **Justification:** Calculates a port based on a hash of the repo path.
+*   **Pros:** O(1) discovery without a state file.
+*   **Cons:** Brittle. If an unrelated application happens to be bound to the calculated port, you have a hard collision. You must implement fallback logic (incrementing the port), which immediately turns this into a worse version of approach #3, requiring probing and identity verification.
+
+**#5: OS process table inspection (`lsof` / `ss`)**
+*   **Justification:** An anti-pattern for this use case.
+*   **Pros:** Does not require the daemon to write out its state.
+*   **Cons:** Extremely slow, highly platform-dependent (`lsof` flags differ drastically between macOS and Linux, and Linux often prefers `ss` or `netstat`), and requires complex string parsing. Brittle and error-prone.
+
+---
+
+### 2. The Single Best Approach
+
+**The Port File Outside the Repo** is the single best approach.
+
+**Why?**
+It natively supports the "dynamic port 0" requirement while providing a highly deterministic, O(1) lookup mechanism. Unlike Unix Domain Sockets, it avoids macOS socket path length limitations and allows developers to easily interact with the daemon using standard HTTP tools (browsers, cURL, Postman) during development. 
+
+The mechanism is simple:
+1. Daemon starts on port 0.
+2. Daemon writes to `~/.config/worktree-daemon/daemons.json` (or a hash-named file in that dir) with its `pid`, `port`, and `repoPath`.
+3. CLI reads the file. To ensure the daemon didn't crash and leave a stale file, the CLI checks if the PID is alive (`process.kill(pid, 0)` in Node) and fires a quick GET request to `http://127.0.0.1:<port>/health`.
+4. If valid, the CLI bakes that port into `.vscode/tasks.json`.
+
+---
+
+### 3. Hybrid Approach
+
+**The "Self-Healing State File" (Port File + Sequential Probing Fallback)**
+
+Combine **#2 (Port File)** with **#5 (Sequential Probing/Identity Check)** for maximum resilience.
+
+*   **Primary Path:** Rely on a JSON state file stored in `~/.config/worktree-daemon/state.json`. It acts as a fast-path cache.
+*   **Validation:** When the CLI reads the port from the file, it **must** verify the daemon's identity by making a request to `http://127.0.0.1:<port>/health?repo=<expected_path>`.
+*   **Fallback Path:** If the JSON file is missing, corrupted, or the health check fails (e.g., the original daemon crashed and the OS assigned that dynamic port to an unrelated app), the CLI spawns a *new* daemon on port 0, updates the state file, and self-heals the system.
+
+---
+
+### 4. Pitfalls and Edge Cases to Handle
+
+If implementing the recommended Port File approach, the implementer must guard against the following:
+
+1.  **Race Conditions on Startup:** If two IDE windows for the same worktree open simultaneously, both might see no daemon running and attempt to spawn one. 
+    *   *Mitigation:* Use atomic file writes (`fs.writeFileSync` to a temporary file, then `fs.renameSync` to the final destination) or implement a basic file lock when writing the state file.
+2.  **Stale State (The "Ghost" Daemon):** The daemon crashes, leaving the JSON file behind.
+    *   *Mitigation:* The CLI must never blindly trust the port in the file. Always use `process.kill(pid, 0)` to check if the PID is alive, followed by an HTTP `/health` probe to ensure the process holding the port is *actually* your daemon and not an unrelated app that recycled the PID/Port.
+3.  **Cross-Platform File Paths:** `os.tmpdir()` can be purged aggressively by macOS, or behave unexpectedly across different Linux distros. 
+    *   *Mitigation:* Prefer a stable user-directory path like `os.homedir() + '/.config/worktree-daemon/'` over `/tmp` to ensure the state file isn't deleted out from under a running daemon by an OS cleanup script.
+4.  **Security Binding:** Ensure the daemon is strictly bound to `127.0.0.1` and not `0.0.0.0`. You do not want these daemons exposed to the local network, especially if they have the power to execute cleanup scripts or modify worktrees.
+Waiting for the debugger to disconnect...
+Waiting for the debugger to disconnect...

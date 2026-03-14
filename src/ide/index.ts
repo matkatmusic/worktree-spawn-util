@@ -2,8 +2,12 @@
 
 import { execFile, spawn } from "node:child_process";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 const execFileAsync = promisify(execFile);
 
@@ -111,6 +115,28 @@ function addTmuxTask(existing: TasksJsonFile, worktreeName: string): Task[] {
   return tasks;
 }
 
+function addHeartbeatTask(existing: TasksJsonFile, worktreeName: string, repoRoot: string): Task[] {
+  const tasks = Array.isArray(existing.tasks) ? existing.tasks : [];
+  const heartbeatLabel = `Heartbeat: ${worktreeName}`;
+  if (tasks.some((t) => t.label === heartbeatLabel)) {
+    console.log(`[ide] "${heartbeatLabel}" task already exists in tasks.json`);
+    return tasks;
+  }
+
+  const heartbeatTask: Task = {
+    label: heartbeatLabel,
+    type: "shell",
+    command: `node "${join(__dirname, "..", "cli", "heartbeat.js")}" --repo-root "${repoRoot}" --worktree ${worktreeName}`,
+    runOptions: { runOn: "folderOpen" },
+    presentation: { reveal: "never", panel: "shared", group: `worktree-${worktreeName}`, focus: false },
+    isBackground: true,
+    problemMatcher: [],
+  };
+
+  tasks.push(heartbeatTask);
+  return tasks;
+}
+
 async function writeUpdatedTasks(tasksJson: TasksJsonFile, tasksPath: string): Promise<void> {
   await writeFile(tasksPath, JSON.stringify(tasksJson, null, 2) + "\n");
   console.log(`[ide] Updated tasks.json`);
@@ -123,6 +149,7 @@ async function writeUpdatedTasks(tasksJson: TasksJsonFile, tasksPath: string): P
 export async function writeWorktreeTasksFile(
   worktreePath: string,
   worktreeName: string,
+  repoRoot?: string,
 ): Promise<TasksFileStatus> {
   const tasksPath = join(worktreePath, ".vscode", "tasks.json");
 
@@ -140,6 +167,9 @@ export async function writeWorktreeTasksFile(
     const originalLength = Array.isArray(existing.tasks) ? existing.tasks.length : 0;
     existing.tasks = addClaudeTask(existing, worktreeName);
     existing.tasks = addTmuxTask(existing, worktreeName);
+    if (repoRoot) {
+      existing.tasks = addHeartbeatTask(existing, worktreeName, repoRoot);
+    }
 
     if (existing.tasks.length === originalLength) {
       return "unchanged";
@@ -155,6 +185,9 @@ export async function writeWorktreeTasksFile(
 
     tasksJson.tasks = addClaudeTask(tasksJson, worktreeName);
     tasksJson.tasks = addTmuxTask(tasksJson, worktreeName);
+    if (repoRoot) {
+      tasksJson.tasks = addHeartbeatTask(tasksJson, worktreeName, repoRoot);
+    }
 
     await mkdir(join(worktreePath, ".vscode"), { recursive: true });
     await writeUpdatedTasks(tasksJson, tasksPath);

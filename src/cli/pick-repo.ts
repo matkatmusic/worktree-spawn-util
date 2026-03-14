@@ -1,12 +1,17 @@
 #!/usr/bin/env node
 
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { readFile, appendFile } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import * as readline from "node:readline/promises";
 import { promisify } from "node:util";
 import { validateRepo, createWorktree } from "../git/index.js";
 import { detectIde, launchIde, writeWorktreeTasksFile, reloadIdeWindow } from "../ide/index.js";
+import { getSocketPath, ensureSocketDir, isSocketAlive } from "../socket/index.js";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 const execFileAsync = promisify(execFile);
 
@@ -85,8 +90,28 @@ try {
   process.exit(1);
 }
 
+// --- Ensure daemon is running ---
+const socketPath = await getSocketPath(selection.repoRoot);
+const daemonAlive = await isSocketAlive(socketPath);
+
+if (!daemonAlive) {
+  ensureSocketDir();
+  const daemonPath = join(__dirname, "daemon.js");
+  const daemonProc = spawn("node", [daemonPath, selection.repoRoot], {
+    detached: true,
+    stdio: "ignore",
+  });
+  daemonProc.unref();
+  console.log(`[pick-repo] Started daemon (PID ${daemonProc.pid}) for ${selection.repoRoot}`);
+
+  // Brief wait for daemon to bind the socket
+  await new Promise((resolve) => setTimeout(resolve, 500));
+} else {
+  console.log("[pick-repo] Daemon already running for this repo");
+}
+
 // --- Set up worktree IDE config ---
-const tasksStatus = await writeWorktreeTasksFile(worktreePath, worktreeName);
+const tasksStatus = await writeWorktreeTasksFile(worktreePath, worktreeName, selection.repoRoot);
 
 // --- Open IDE window ---
 const ide = detectIde();

@@ -200,6 +200,65 @@ describe("writeWorktreeTasksFile", () => {
     );
     expect(content).toBe(originalContent);
   });
+
+  it("creates 3 tasks when repoRoot is provided (Claude + tmux + heartbeat)", async () => {
+    const status = await writeWorktreeTasksFile(tmpDir, "my-feature", "/fake/repo");
+    expect(status).toBe("created");
+
+    const content = await readFile(join(tmpDir, ".vscode", "tasks.json"), "utf-8");
+    const parsed = JSON.parse(content);
+
+    expect(parsed.tasks).toHaveLength(3);
+    expect(parsed.tasks[0].label).toBe("Launch Claude");
+    expect(parsed.tasks[1].label).toBe("tmux: my-feature");
+    expect(parsed.tasks[2].label).toBe("Heartbeat: my-feature");
+  });
+
+  it("heartbeat task contains correct repo-root and worktree args", async () => {
+    await writeWorktreeTasksFile(tmpDir, "my-feature", "/fake/repo");
+
+    const content = await readFile(join(tmpDir, ".vscode", "tasks.json"), "utf-8");
+    const parsed = JSON.parse(content);
+    const hbTask = parsed.tasks.find((t: { label: string }) => t.label === "Heartbeat: my-feature");
+
+    expect(hbTask).toBeTruthy();
+    expect(hbTask.command).toContain('--repo-root "/fake/repo"');
+    expect(hbTask.command).toContain("--worktree my-feature");
+    expect(hbTask.command).toContain("heartbeat.js");
+  });
+
+  it("heartbeat task has reveal=never and isBackground=true", async () => {
+    await writeWorktreeTasksFile(tmpDir, "my-feature", "/fake/repo");
+
+    const content = await readFile(join(tmpDir, ".vscode", "tasks.json"), "utf-8");
+    const parsed = JSON.parse(content);
+    const hbTask = parsed.tasks.find((t: { label: string }) => t.label === "Heartbeat: my-feature");
+
+    expect(hbTask.presentation.reveal).toBe("never");
+    expect(hbTask.isBackground).toBe(true);
+    expect(hbTask.runOptions.runOn).toBe("folderOpen");
+  });
+
+  it("does not create heartbeat task when repoRoot is omitted (backward compat)", async () => {
+    await writeWorktreeTasksFile(tmpDir, "my-feature");
+
+    const content = await readFile(join(tmpDir, ".vscode", "tasks.json"), "utf-8");
+    const parsed = JSON.parse(content);
+
+    expect(parsed.tasks).toHaveLength(2);
+    expect(parsed.tasks.some((t: { label: string }) => t.label.startsWith("Heartbeat:"))).toBe(false);
+  });
+
+  it("heartbeat task is idempotent", async () => {
+    await writeWorktreeTasksFile(tmpDir, "my-feature", "/fake/repo");
+    const status = await writeWorktreeTasksFile(tmpDir, "my-feature", "/fake/repo");
+    expect(status).toBe("unchanged");
+
+    const content = await readFile(join(tmpDir, ".vscode", "tasks.json"), "utf-8");
+    const parsed = JSON.parse(content);
+    const hbTasks = parsed.tasks.filter((t: { label: string }) => t.label === "Heartbeat: my-feature");
+    expect(hbTasks).toHaveLength(1);
+  });
 });
 
 describe("reloadIdeWindow", () => {

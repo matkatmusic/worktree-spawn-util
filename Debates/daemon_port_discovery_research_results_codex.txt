@@ -1,0 +1,393 @@
+Debugger listening on ws://127.0.0.1:53862/c482198d-1826-44d7-83f1-cdb909b1e2e3
+For help, see: https://nodejs.org/en/docs/inspector
+Debugger attached.
+Reading prompt from stdin...
+OpenAI Codex v0.114.0 (research preview)
+--------
+workdir: /Users/matkatmusicllc/Programming/worktree-spawn-util
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: high
+reasoning summaries: none
+session id: 019ceb7c-458a-7450-96f1-42b605847f6b
+--------
+user
+## Research Task: Daemon Port Discovery for Worktree Heartbeat System
+
+### Context
+
+A developer tool manages git worktrees. The architecture:
+
+1. A CLI (`pick-repo.ts`) creates a git worktree and generates a `.vscode/tasks.json` file
+2. When the IDE opens the worktree, a background task runs a curl command every 5 seconds: `curl -X POST http://localhost:<PORT>/heartbeat/<worktree-name>`
+3. A daemon process receives these heartbeats. If no heartbeat arrives for 15 seconds, the daemon concludes the IDE window was closed and triggers cleanup (deleting the worktree, killing tmux sessions, etc.)
+4. The daemon listens on a dynamic port (port 0) assigned by the OS to avoid conflicts
+5. The port must be known at tasks.json generation time so the curl URL is correct
+
+**The Problem:** If the daemon was already started by a previous `pick-repo.ts` invocation, a new invocation needs to discover the daemon's port to write the correct curl URL into the new worktree's tasks.json.
+
+**Constraint:** The solution must NOT write the port to a file inside the git repository.
+
+**Stack:** TypeScript/Node.js. Primary platform: macOS. Secondary: Linux.
+
+### Research Questions
+
+1. What are ALL viable approaches to share a dynamically assigned port between independent process invocations without a file in the repo?
+
+2. For each approach, evaluate:
+   - Implementation complexity (lines of code, dependencies needed)
+   - Reliability (crash recovery, stale state handling, race conditions)
+   - Cross-platform support (macOS + Linux)
+   - Multi-daemon support (multiple repos with independent daemons running simultaneously)
+   - Security (localhost binding, no unintended network exposure)
+   - Developer experience (debuggability, transparency, ease of troubleshooting)
+   - Industry precedent (what do similar tools like tmux, Docker, Chrome DevTools, PostgreSQL do?)
+
+3. What is the single best approach and why?
+
+4. Are there hybrid approaches that combine strengths of multiple options?
+
+5. What pitfalls and edge cases must the implementer handle?
+
+### Approaches to Consider (non-exhaustive)
+
+- Unix domain socket at a well-known path
+- Port/PID file outside the repo (tmpdir, ~/.config, XDG dirs)
+- Hash-based deterministic port derivation
+- OS process table inspection (lsof/ss)
+- Fixed port with sequential probing
+- Process argument inspection (ps)
+- Any other approach you think is viable
+
+mcp startup: no servers
+codex
+I’m checking the current codebase first so the recommendation fits the existing architecture, then I’ll compare the viable IPC/discovery patterns against your constraints.
+exec
+/bin/zsh -lc 'pwd && rg --files' in /Users/matkatmusicllc/Programming/worktree-spawn-util succeeded in 0ms:
+/Users/matkatmusicllc/Programming/worktree-spawn-util
+src/process/index.ts
+src/git/index.ts
+src/index.ts
+src/cli/pick-repo.ts
+src/cli/spawn.ts
+src/cli/daemon.ts
+src/config/index.ts
+src/ide/index.ts
+CLAUDE.md
+RunMeFirst.sh
+vitest.config.ts
+documents/platform-docs.md
+documents/roadmap.md
+tsconfig.json
+package.json
+package-lock.json
+Debates/daemon_port_discovery_debate_prompt.txt
+Debates/daemon_port_discovery_research_prompt.txt
+Debates/daemon_port_discovery_research_results_codex.txt
+exec
+/bin/zsh -lc "rg -n \"heartbeat|daemon|tasks.json|worktree|port 0|listen\\(|localhost|curl\" ." in /Users/matkatmusicllc/Programming/worktree-spawn-util succeeded in 0ms:
+./package.json:2:  "name": "worktree-spawn-util",
+./src/git/index.ts:1:// git module — worktree CRUD, branch operations, merge detection
+./src/git/index.ts:28:/** Parse `git worktree list --porcelain` output into WorktreeInfo[]. */
+./src/git/index.ts:35:      const pathLine = lines.find((l) => l.startsWith("worktree "));
+./src/git/index.ts:38:        path: pathLine ? pathLine.slice("worktree ".length) : "",
+./src/git/index.ts:45: * Create a git worktree inside `<repoRoot>/.worktrees/<worktreeName>`.
+./src/git/index.ts:47: * Idempotent: if the worktree already exists with the correct branch, returns it.
+./src/git/index.ts:48: * Throws if the branch is checked out elsewhere or the directory exists but isn't a worktree.
+./src/git/index.ts:52:  worktreeName: string,
+./src/git/index.ts:55:  const worktreePath = join(repoRoot, ".worktrees", worktreeName);
+./src/git/index.ts:57:  // Check existing worktrees
+./src/git/index.ts:58:  const listRaw = await git.raw(["worktree", "list", "--porcelain"]);
+./src/git/index.ts:63:    (wt) => wt.path === worktreePath && wt.branch === worktreeName,
+./src/git/index.ts:69:  // Branch checked out in a different worktree
+./src/git/index.ts:70:  const branchConflict = existing.find((wt) => wt.branch === worktreeName);
+./src/git/index.ts:73:      `Branch "${worktreeName}" is already checked out in worktree: ${branchConflict.path}`,
+./src/git/index.ts:77:  // Directory exists on disk but isn't a known worktree
+./src/git/index.ts:80:    await access(worktreePath);
+./src/git/index.ts:92:      `Directory exists but is not a worktree for this repo: ${worktreePath}`,
+./src/git/index.ts:96:  // Ensure .worktrees directory exists
+codex
+I found existing notes in `Debates/`, but I’m treating them as prior context rather than source-of-truth. Next I’m reading the current CLI/daemon stubs and a couple of the internal research docs to align the recommendation with how this repo is heading.
+exec
+/bin/zsh -lc "sed -n '1,260p' src/cli/daemon.ts" in /Users/matkatmusicllc/Programming/worktree-spawn-utilexec
+/bin/zsh -lc "sed -n '1,240p' src/cli/pick-repo.ts" in /Users/matkatmusicllc/Programming/worktree-spawn-util succeeded in 0ms:
+#!/usr/bin/env node
+
+const repoRoot = process.argv[2];
+
+console.log("[daemon stub]", { repoRoot: repoRoot ?? "(none)" });
+process.exit(0);
+ succeeded in 0ms:
+#!/usr/bin/env node
+
+import { execFile } from "node:child_process";
+import { readFile, appendFile } from "node:fs/promises";
+import { join } from "node:path";
+import * as readline from "node:readline/promises";
+import { promisify } from "node:util";
+import { validateRepo, createWorktree } from "../git/index.js";
+import { detectIde, launchIde, writeWorktreeTasksFile, reloadIdeWindow } from "../ide/index.js";
+
+const execFileAsync = promisify(execFile);
+
+/** Replace characters invalid in git ref names with underscores. */
+function sanitizeWorktreeName(raw: string): string {
+  return raw
+    .replace(/[ ~^:?*[\]\\]/g, "_") // invalid single chars
+    .replace(/\.\./g, "_")          // no double dots
+    .replace(/@\{/g, "_")           // no @{
+    .replace(/\.lock$/g, "")        // no .lock suffix
+    .replace(/^[./]+|[./]+$/g, "")  // no leading/trailing . or /
+exec
+/bin/zsh -lc "sed -n '1,260p' Debates/daemon_port_discovery_research_results_codex.txt" in /Users/matkatmusicllc/Programming/worktree-spawn-utilexec
+/bin/zsh -lc "sed -n '1,220p' Debates/daemon_port_discovery_debate_results_codex.txt" in /Users/matkatmusicllc/Programming/worktree-spawn-util succeeded in 0ms:
+Debugger listening on ws://127.0.0.1:53862/c482198d-1826-44d7-83f1-cdb909b1e2e3
+For help, see: https://nodejs.org/en/docs/inspector
+Debugger attached.
+Reading prompt from stdin...
+OpenAI Codex v0.114.0 (research preview)
+--------
+workdir: /Users/matkatmusicllc/Programming/worktree-spawn-util
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: high
+reasoning summaries: none
+session id: 019ceb7c-458a-7450-96f1-42b605847f6b
+--------
+user
+## Research Task: Daemon Port Discovery for Worktree Heartbeat System
+
+### Context
+
+ succeeded in 0ms:
+Debugger listening on ws://127.0.0.1:53739/5f15ead6-4810-4e57-a319-1c178eec0af6
+For help, see: https://nodejs.org/en/docs/inspector
+Debugger attached.
+Reading prompt from stdin...
+OpenAI Codex v0.114.0 (research preview)
+--------
+workdir: /Users/matkatmusicllc/Programming/worktree-spawn-util
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: high
+reasoning summaries: none
+session id: 019ceb78-89e5-78b3-a8b1-5464153e2931
+--------
+user
+## Debate Topic: Daemon Port Discovery for Worktree Heartbeat System
+
+### Context
+
+codex
+The current implementation is still early, which helps here: there isn’t much migration cost yet. I’m pulling a few primary sources now so the recommendation is grounded in how established local daemons actually expose and discover endpoints.
+🌐 Searching the web...
+🌐 Searched: Docker daemon unix socket official docs site:docs.docker.com
+🌐 Searching the web...
+🌐 Searched: site:postgresql.org docs unix-domain sockets PostgreSQL official
+🌐 Searching the web...
+🌐 Searched: site:chromium.googlesource.com DevToolsActivePort file chrome remote debugging
+🌐 Searching the web...
+🌐 Searched: "DevToolsActivePort" chromium source
+🌐 Searching the web...
+🌐 Searched: https://chromium.googlesource.com/chromium/src/%2B/master/chrome/test/chromedriver/chrome_launcher.cc
+🌐 Searching the web...
+🌐 Searched: site:postgresql.org/docs unix socket directory PostgreSQL official server config
+🌐 Searching the web...
+🌐 Searched: site:vite.dev/config/server-options server.port strictPort official
+🌐 Searching the web...
+🌐 Searched: site:freedesktop.org systemd socket activation official documentation
+🌐 Searching the web...
+🌐 Searched: site:developer.apple.com launchd sockets plist official
+🌐 Searching the web...
+🌐 Searched: site:curl.se/docs/manpage.html --unix-socket curl
+🌐 Searching the web...
+🌐 Searched: '--unix-socket' in https://curl.se/docs/manpage.html
+🌐 Searching the web...
+🌐 Searched: 'server.listen(path' in https://nodejs.org/api/http.html
+🌐 Searching the web...
+🌐 Searched: site:nodejs.org/api net ipc support path unnamed pipe unix domain socket official
+🌐 Searching the web...
+🌐 Searched: site:man7.org lsof man page
+codex
+The viable set is narrowing into two families: explicit local IPC endpoints and external registries. I’m checking one more slice of precedent now, mainly tools that either avoid discovery entirely with Unix sockets or use a user-owned state file outside the project tree.
+🌐 Searching the web...
+🌐 Searched: site:docs.docker.com docker daemon socket unix default official
+exec
+/bin/zsh -lc "nl -ba src/ide/index.ts | sed -n '1,220p'" in /Users/matkatmusicllc/Programming/worktree-spawn-util succeeded in 0ms:
+     1	// ide module — configurable IDE launcher (code, agy, cursor, etc.)
+     2	
+     3	import { execFile, spawn } from "node:child_process";
+     4	import { mkdir, readFile, writeFile } from "node:fs/promises";
+     5	import { join } from "node:path";
+     6	import { promisify } from "node:util";
+     7	
+     8	const execFileAsync = promisify(execFile);
+     9	
+    10	export type IdeConfig = {
+    11	  command: string;
+    12	};
+    13	
+    14	/** Map macOS bundle identifiers to CLI commands. */
+    15	const IDE_BUNDLE_MAP: Record<string, string> = {
+    16	  "com.microsoft.VSCode": "code",
+    17	  "com.microsoft.VSCodeInsiders": "code-insiders",
+    18	  "com.google.antigravity": "agy",
+    19	};
+    20	
+exec
+/bin/zsh -lc 'rg -n "heartbeat|cleanup|daemon|socket|tasks.json|curl|tmux" documents src test' in /Users/matkatmusicllc/Programming/worktree-spawn-util succeeded in 0ms:
+test/ide.test.ts:121:  it("returns 'created' with both Claude and tmux tasks", async () => {
+test/ide.test.ts:126:      join(tmpDir, ".vscode", "tasks.json"),
+test/ide.test.ts:136:    expect(parsed.tasks[1].label).toBe("tmux: my-feature");
+test/ide.test.ts:137:    expect(parsed.tasks[1].command).toBe("tmux new-session -A -s my-feature");
+test/ide.test.ts:144:      join(tmpDir, ".vscode", "tasks.json"),
+test/ide.test.ts:160:      join(tmpDir, ".vscode", "tasks.json"),
+test/ide.test.ts:168:      join(tmpDir, ".vscode", "tasks.json"),
+test/ide.test.ts:176:    expect(parsed.tasks[2].label).toBe("tmux: my-feature");
+test/ide.test.ts:184:        { label: "tmux: my-feature", type: "shell", command: "tmux new-session -A -s my-feature" },
+test/ide.test.ts:190:      join(tmpDir, ".vscode", "tasks.json"),
+test/ide.test.ts:198:      join(tmpDir, ".vscode", "tasks.json"),
+documents/platform-docs.md:10:4. Monitor the IDE/agent process and, when it exits, automatically clean up — deleting the worktree folder and killing the associated tmux session.
+documents/platform-docs.md:11:5. Optionally spawn Claude Code or a tmux session within the worktree environment.
+documents/platform-docs.md:142:**Purpose:** Tracks a running IDE or agent process by PID and detects when it exits, so teardown logic (worktree deletion, tmux kill) can be triggered.
+documents/platform-docs.md:155:- On process exit, emit an event or invoke a callback that triggers git module teardown and tmux session kill.
+documents/platform-docs.md:157:**Connections:** Receives a `ProcessHandle` from the ide module. Reads poll interval from `SpawnConfig`. On close detection, delegates cleanup back to the git module and the tmux/Claude spawning logic in the CLI layer.
+documents/platform-docs.md:163:**Purpose:** The primary command-line interface for creating and entering a worktree session. Intended to be invoked by an external task runner (e.g., `tasks.json` in the parent orchestrator).
+documents/platform-docs.md:189:5. Spawn Claude Code and/or a tmux session inside the worktree.
+documents/platform-docs.md:195:### `src/cli/daemon.ts` — Daemon CLI Entry Point
+documents/platform-docs.md:197:**Purpose:** A background process entry point that watches a repository root for lifecycle events, coordinating multiple concurrent worktree sessions or handling cleanup of orphaned worktrees.
+Plan update
+The repo is scaffold-level, so the answer will focus on design fit: task generation lives in the IDE module and the daemon entry point is still flexible. I’m now comparing the viable discovery mechanisms against local-daemon precedent and your repo constraints.
+  ✓ Inspect local task-generation and daemon entry points
+  → Gather primary-source precedent for local daemon transport/discovery patterns
+  • Rank viable approaches and recommend a single design for this repo
+🌐 Searching the web...
+🌐 Searched: site:docs.docker.com Docker daemon listens on unix socket by default official
+🌐 Searching the web...
+🌐 Searched: site:postgresql.org/docs/current unix_socket_directories official
+🌐 Searching the web...
+🌐 Searched: site:man7.org tmux socket path man page
+🌐 Searching the web...
+🌐 Searched: site:developer.chrome.com docs chromedriver remote-debugging-pipe more reliable more secure
+🌐 Searching the web...
+🌐 Searched: site:chromium.googlesource.com DevToolsActivePort file generated by chrome
+🌐 Searching the web...
+🌐 Searched: site:curl.se/docs/manpage.html unix-socket curl manpage
+🌐 Searching the web...
+🌐 Searched: '--unix-socket' in https://curl.se/docs/manpage.html
+🌐 Searching the web...
+🌐 Searched: site:nodejs.org/api/http.html socketPath option request official
+🌐 Searching the web...
+🌐 Searched: site:nodejs.org/download/release/latest-v20.x/docs/api/http.html socketPath
+🌐 Searching the web...
+🌐 Searched: site:freedesktop.org systemd.socket man official
+🌐 Searching the web...
+🌐 Searched: site:man7.org lsof.8 man page
+🌐 Searching the web...
+🌐 Searched: site:manpagez.com ps man page macOS args command
+🌐 Searching the web...
+🌐 Searched: site:vite.dev/config/server-options server.port strictPort
+🌐 Searching the web...
+🌐 Searched: site:man7.org ssh-agent UNIX domain socket SSH_AUTH_SOCK
+codex
+The best design for this repo is to stop solving “port discovery” at all: make the heartbeat daemon speak HTTP over a Unix domain socket, and have the generated task use `curl --unix-socket ... http://localhost/heartbeat/<worktree>`. In this codebase, that is a low-cost change because task generation is centralized in [src/ide/index.ts:123](/Users/matkatmusicllc/Programming/worktree-spawn-util/src/ide/index.ts#L123) and the daemon is still a stub in [src/cli/daemon.ts:1](/Users/matkatmusicllc/Programming/worktree-spawn-util/src/cli/daemon.ts#L1).
+
+**Viable Approaches**
+1. Unix domain socket as the primary transport: `80-150` LoC, no deps; highest reliability because there is no dynamic port to discover; native on macOS and Linux; multi-daemon is easy with one socket per repo hash; strongest security because nothing is network-exposed; good DX with `curl`, worse for browser/Postman; strongest precedent overall: Docker, tmux, PostgreSQL, ssh-agent all rely on local sockets.
+2. Port/PID state file outside the repo: `60-120` LoC, no deps if you use atomic rename; very reliable if you store `{pid, port, repoRealpath, startedAt, nonce}` and validate with `kill(pid, 0)` plus `/health`; macOS/Linux fine; multi-daemon easy with one file per repo hash; security depends on `127.0.0.1` binding and `0700` parent dir; best DX if you want plain TCP HTTP; precedent: Chrome/ChromeDriver uses `DevToolsActivePort`, PostgreSQL also writes companion lock state.
+3. Unix socket as a control plane, ephemeral TCP as a data plane: `110-180` LoC; very reliable; macOS/Linux fine; multi-daemon fine; safer than pure TCP because discovery is local-only; best hybrid DX because heartbeats can stay HTTP/TCP if you want them inspectable, while discovery is deterministic.
+4. Fixed port range with sequential probing plus a health endpoint: `40-90` LoC; acceptable reliability for small daemon counts, but races and accidental collisions are real; macOS/Linux fine; multi-daemon works only until the range gets crowded; security is okay if bound to `127.0.0.1`; precedent: dev servers like Vite probe the next port, but they also expose that the actual port may drift.
+5. Hash-based deterministic port derivation: `30-70` LoC for the base idea, more once collision handling is honest; reliability is weaker because a collision with another app or another repo forces a fallback, which recreates discovery anyway; cross-platform fine; multi-daemon only good if collisions are rare; security same as localhost TCP; low operational transparency when the chosen port is “magic”.
+6. `launchd`/`systemd` socket activation: highest reliability once installed, but `150-300+` LoC plus service manifests and install flow; not a clean single solution across macOS and Linux; multi-daemon can be good; strong precedent in OS-managed daemons, but probably too heavy for this tool.
+7. Process table inspection via `lsof`/`ss`: `40-100` LoC plus shellout parsing; brittle on systems missing the expected tool or with permission quirks; cross-platform is uneven because macOS and Linux use different commands; okay as a recovery tool, not a primary design.
+8. Process argument inspection via `ps`: lowest implementation cost, worst reliability; only works if you deliberately stuff the repo identity or port into args or process title, and even then parsing is brittle and stale-state handling is poor. I would treat this as debugging-only.
+
+**Single Best Choice**
+Use a per-repo Unix socket and make it the heartbeat endpoint. For this tool, the heartbeat is local-only, machine-local, and generated into `tasks.json` ahead of time. A socket path like `/tmp/wtsu-<uid>/<repoHash>.sock` is deterministic, short enough for macOS path limits, supports multiple repos cleanly, and removes the entire dynamic-port-discovery problem. If you later want a human-friendly debug endpoint, add an optional localhost TCP port and expose it through the socket.
+
+**Best Hybrids**
+- Best practical hybrid: UDS for heartbeat/control, optional TCP port for debugging or future browser-facing APIs.
+- Best TCP-only hybrid: external state file outside the repo as a fast path, always validated by `/health` before use.
+- Recovery hybrid: state file or socket first, `lsof`/`ss` only as a last-resort repair path.
+
+**Pitfalls To Handle**
+- Use `realpath(repoRoot)` before hashing, or symlinks will create duplicate daemon identities.
+- Keep socket paths short; macOS Unix socket paths are tighter than Linux.
+- On startup, if the socket path already exists, try connecting before unlinking it; only remove it when it is stale.
+- Put sockets/state under a user-owned runtime dir with `0700` permissions.
+- If you keep any TCP endpoint, bind to `127.0.0.1` explicitly, not `0.0.0.0`.
+- If you use a state file, never trust it without PID liveness plus daemon identity validation.
+- Handle concurrent `pick-repo.ts` invocations for the same repo so only one daemon wins.
+- If the repo is moved on disk, the old daemon identity should not be silently reused.
+- If multiple IDE windows can heartbeat the same worktree, decide whether that is one lease or reference-counted leases.
+- If you use `curl --unix-socket`, choose a socket path without spaces and verify the minimum curl version in your target environments.
+
+**Sources**
+- Docker daemon sockets: https://docs.docker.com/reference/cli/dockerd/
+- Docker remote access security: https://docs.docker.com/engine/daemon/remote-access/
+- curl `--unix-socket`: https://curl.se/docs/manpage.html
+- Node IPC / Unix socket support: https://nodejs.org/download/release/latest-v20.x/docs/api/net.html
+- tmux socket-based server model: https://github.com/tmux/tmux/wiki/Advanced-Use
+- PostgreSQL Unix sockets and companion lock files: https://www.postgresql.org/docs/current/runtime-config-connection.html
+- Chromium `DevToolsActivePort` file precedent: https://chromium.googlesource.com/chromium/src/+/main/content/browser/devtools/devtools_http_handler.cc
+- ChromeDriver source preferring pipes over remote ports: https://chromium.googlesource.com/chromium/src/+/main/chrome/test/chromedriver/chrome_launcher.cc
+- Vite port probing precedent: https://vite.dev/config/server-options
+- `systemd` socket activation: https://www.freedesktop.org/software/systemd/man/latest/sd_listen_fds.html
+- `launchd` socket registration: https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html
+
+If you want, I can turn this into a concrete implementation plan for this repo, including the exact socket path scheme and the `tasks.json` command shape.
+tokens used
+151,450
+The best design for this repo is to stop solving “port discovery” at all: make the heartbeat daemon speak HTTP over a Unix domain socket, and have the generated task use `curl --unix-socket ... http://localhost/heartbeat/<worktree>`. In this codebase, that is a low-cost change because task generation is centralized in [src/ide/index.ts:123](/Users/matkatmusicllc/Programming/worktree-spawn-util/src/ide/index.ts#L123) and the daemon is still a stub in [src/cli/daemon.ts:1](/Users/matkatmusicllc/Programming/worktree-spawn-util/src/cli/daemon.ts#L1).
+
+**Viable Approaches**
+1. Unix domain socket as the primary transport: `80-150` LoC, no deps; highest reliability because there is no dynamic port to discover; native on macOS and Linux; multi-daemon is easy with one socket per repo hash; strongest security because nothing is network-exposed; good DX with `curl`, worse for browser/Postman; strongest precedent overall: Docker, tmux, PostgreSQL, ssh-agent all rely on local sockets.
+2. Port/PID state file outside the repo: `60-120` LoC, no deps if you use atomic rename; very reliable if you store `{pid, port, repoRealpath, startedAt, nonce}` and validate with `kill(pid, 0)` plus `/health`; macOS/Linux fine; multi-daemon easy with one file per repo hash; security depends on `127.0.0.1` binding and `0700` parent dir; best DX if you want plain TCP HTTP; precedent: Chrome/ChromeDriver uses `DevToolsActivePort`, PostgreSQL also writes companion lock state.
+3. Unix socket as a control plane, ephemeral TCP as a data plane: `110-180` LoC; very reliable; macOS/Linux fine; multi-daemon fine; safer than pure TCP because discovery is local-only; best hybrid DX because heartbeats can stay HTTP/TCP if you want them inspectable, while discovery is deterministic.
+4. Fixed port range with sequential probing plus a health endpoint: `40-90` LoC; acceptable reliability for small daemon counts, but races and accidental collisions are real; macOS/Linux fine; multi-daemon works only until the range gets crowded; security is okay if bound to `127.0.0.1`; precedent: dev servers like Vite probe the next port, but they also expose that the actual port may drift.
+5. Hash-based deterministic port derivation: `30-70` LoC for the base idea, more once collision handling is honest; reliability is weaker because a collision with another app or another repo forces a fallback, which recreates discovery anyway; cross-platform fine; multi-daemon only good if collisions are rare; security same as localhost TCP; low operational transparency when the chosen port is “magic”.
+6. `launchd`/`systemd` socket activation: highest reliability once installed, but `150-300+` LoC plus service manifests and install flow; not a clean single solution across macOS and Linux; multi-daemon can be good; strong precedent in OS-managed daemons, but probably too heavy for this tool.
+7. Process table inspection via `lsof`/`ss`: `40-100` LoC plus shellout parsing; brittle on systems missing the expected tool or with permission quirks; cross-platform is uneven because macOS and Linux use different commands; okay as a recovery tool, not a primary design.
+8. Process argument inspection via `ps`: lowest implementation cost, worst reliability; only works if you deliberately stuff the repo identity or port into args or process title, and even then parsing is brittle and stale-state handling is poor. I would treat this as debugging-only.
+
+**Single Best Choice**
+Use a per-repo Unix socket and make it the heartbeat endpoint. For this tool, the heartbeat is local-only, machine-local, and generated into `tasks.json` ahead of time. A socket path like `/tmp/wtsu-<uid>/<repoHash>.sock` is deterministic, short enough for macOS path limits, supports multiple repos cleanly, and removes the entire dynamic-port-discovery problem. If you later want a human-friendly debug endpoint, add an optional localhost TCP port and expose it through the socket.
+
+**Best Hybrids**
+- Best practical hybrid: UDS for heartbeat/control, optional TCP port for debugging or future browser-facing APIs.
+- Best TCP-only hybrid: external state file outside the repo as a fast path, always validated by `/health` before use.
+- Recovery hybrid: state file or socket first, `lsof`/`ss` only as a last-resort repair path.
+
+**Pitfalls To Handle**
+- Use `realpath(repoRoot)` before hashing, or symlinks will create duplicate daemon identities.
+- Keep socket paths short; macOS Unix socket paths are tighter than Linux.
+- On startup, if the socket path already exists, try connecting before unlinking it; only remove it when it is stale.
+- Put sockets/state under a user-owned runtime dir with `0700` permissions.
+- If you keep any TCP endpoint, bind to `127.0.0.1` explicitly, not `0.0.0.0`.
+- If you use a state file, never trust it without PID liveness plus daemon identity validation.
+- Handle concurrent `pick-repo.ts` invocations for the same repo so only one daemon wins.
+- If the repo is moved on disk, the old daemon identity should not be silently reused.
+- If multiple IDE windows can heartbeat the same worktree, decide whether that is one lease or reference-counted leases.
+- If you use `curl --unix-socket`, choose a socket path without spaces and verify the minimum curl version in your target environments.
+
+**Sources**
+- Docker daemon sockets: https://docs.docker.com/reference/cli/dockerd/
+- Docker remote access security: https://docs.docker.com/engine/daemon/remote-access/
+- curl `--unix-socket`: https://curl.se/docs/manpage.html
+- Node IPC / Unix socket support: https://nodejs.org/download/release/latest-v20.x/docs/api/net.html
+- tmux socket-based server model: https://github.com/tmux/tmux/wiki/Advanced-Use
+- PostgreSQL Unix sockets and companion lock files: https://www.postgresql.org/docs/current/runtime-config-connection.html
+- Chromium `DevToolsActivePort` file precedent: https://chromium.googlesource.com/chromium/src/+/main/content/browser/devtools/devtools_http_handler.cc
+- ChromeDriver source preferring pipes over remote ports: https://chromium.googlesource.com/chromium/src/+/main/chrome/test/chromedriver/chrome_launcher.cc
+- Vite port probing precedent: https://vite.dev/config/server-options
+- `systemd` socket activation: https://www.freedesktop.org/software/systemd/man/latest/sd_listen_fds.html
+- `launchd` socket registration: https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html
+
+If you want, I can turn this into a concrete implementation plan for this repo, including the exact socket path scheme and the `tasks.json` command shape.
+Waiting for the debugger to disconnect...

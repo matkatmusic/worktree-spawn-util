@@ -7,13 +7,14 @@
     - [x] splits integrated terminal into 2 terminals
     - [x] spawns claude in plan mode in top terminal
     - [x] spawns tmux in bottom terminal    
+    - [ ] detect when the new ide window is closed
     
 Future features (in order)
-- [ ] detect when the ide window is closed
     - [ ] When the IDE window is closed: 
         - [] kill the tmux session
         - if the worktree branch has been merged into the branch it was created from:
-            - if the only changes remaining are in .vscode/tasks.json and .claude/settings.json:
+            - if the only changes remaining are in .vscode/tasks.json and .claude/settings.json and the http heartbeat stuff:
                 - [] delete the worktree
             - else:
                 notify the user that the worktree hasn't been removed because it has unstaged changes. 
+- [ ] when claude is spawned, name the conversation with the same name as the worktree.

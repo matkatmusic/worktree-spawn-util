@@ -5,7 +5,9 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "bin": {
-    "wt-pick-repo": "dist/cli/pick-repo.js"
+    "wt-pick-repo": "dist/cli/pick-repo.js",
+    "wt-daemon": "dist/cli/daemon.js",
+    "wt-heartbeat": "dist/cli/heartbeat.js"
   },
   "scripts": {
     "build": "tsc",
