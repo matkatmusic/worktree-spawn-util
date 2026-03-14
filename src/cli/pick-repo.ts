@@ -1,8 +1,12 @@
 #!/usr/bin/env node
 
 import { execFile } from "node:child_process";
+import { readFile, appendFile } from "node:fs/promises";
+import { join } from "node:path";
+import * as readline from "node:readline/promises";
 import { promisify } from "node:util";
-import { validateRepo } from "../git/index.js";
+import { validateRepo, createWorktree } from "../git/index.js";
+import { detectIde, launchIde } from "../ide/index.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -67,4 +71,57 @@ if (!selection.isValid) {
 }
 
 console.log(`[pick-repo] Repo: ${selection.repoRoot}`);
-console.log(`[pick-repo] Worktree: ${worktreeName}`);
+
+// --- Create worktree ---
+let worktreePath: string;
+try {
+  const result = await createWorktree(selection.repoRoot, worktreeName);
+  worktreePath = result.path;
+  console.log(`[pick-repo] Worktree created at: ${result.path}`);
+  console.log(`[pick-repo] Branch: ${result.branch}`);
+} catch (err: unknown) {
+  const message = err instanceof Error ? err.message : String(err);
+  console.error(`[pick-repo] Failed to create worktree: ${message}`);
+  process.exit(1);
+}
+
+// --- Open IDE window ---
+const ide = detectIde();
+if (ide) {
+  launchIde(ide, worktreePath);
+} else {
+  console.log(`[pick-repo] Could not detect IDE. Open manually: ${worktreePath}`);
+}
+
+// --- Prompt to add .worktrees to .gitignore ---
+const gitignorePath = join(selection.repoRoot, ".gitignore");
+let gitignoreContent = "";
+try {
+  gitignoreContent = await readFile(gitignorePath, "utf-8");
+} catch {
+  // .gitignore may not exist yet
+}
+
+const alreadyIgnored = gitignoreContent
+  .split("\n")
+  .some((line) => line.trim() === ".worktrees");
+
+if (!alreadyIgnored) {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+  const answer = await rl.question(
+    "[pick-repo] Add .worktrees to .gitignore? (y/n) ",
+  );
+  rl.close();
+
+  if (answer.trim().toLowerCase() === "y") {
+    const suffix =
+      gitignoreContent.endsWith("\n") || !gitignoreContent ? "" : "\n";
+    await appendFile(gitignorePath, suffix + ".worktrees\n");
+    console.log("[pick-repo] Added .worktrees to .gitignore");
+  } else {
+    console.log("[pick-repo] Skipped — .worktrees/ will appear as untracked");
+  }
+}
