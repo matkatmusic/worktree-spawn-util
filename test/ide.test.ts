@@ -2,11 +2,12 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtemp, rm, readFile, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { spawn } from "node:child_process";
-import { detectIde, launchIde, writeWorktreeTasksFile } from "../src/ide/index.js";
+import { spawn, execFile } from "node:child_process";
+import { detectIde, launchIde, writeWorktreeTasksFile, reloadIdeWindow } from "../src/ide/index.js";
 
 vi.mock("node:child_process", () => ({
   spawn: vi.fn(() => ({ unref: vi.fn() })),
+  execFile: vi.fn((_cmd: string, _args: string[], cb: Function) => cb(null, "", "")),
 }));
 
 const mockSpawn = vi.mocked(spawn);
@@ -117,8 +118,9 @@ describe("writeWorktreeTasksFile", () => {
     await rm(tmpDir, { recursive: true, force: true });
   });
 
-  it("creates .vscode/tasks.json with Launch Claude task when file is missing", async () => {
-    await writeWorktreeTasksFile(tmpDir, "my-feature");
+  it("returns 'created' when file is missing", async () => {
+    const status = await writeWorktreeTasksFile(tmpDir, "my-feature");
+    expect(status).toBe("created");
 
     const content = await readFile(
       join(tmpDir, ".vscode", "tasks.json"),
@@ -132,7 +134,7 @@ describe("writeWorktreeTasksFile", () => {
     expect(parsed.tasks[0].runOptions.runOn).toBe("folderOpen");
   });
 
-  it("adds Launch Claude task to existing tasks.json preserving other tasks", async () => {
+  it("returns 'updated' and preserves existing tasks", async () => {
     const existing = {
       version: "2.0.0",
       tasks: [{ label: "Build", type: "shell", command: "npm run build" }],
@@ -143,7 +145,8 @@ describe("writeWorktreeTasksFile", () => {
       JSON.stringify(existing),
     );
 
-    await writeWorktreeTasksFile(tmpDir, "my-feature");
+    const status = await writeWorktreeTasksFile(tmpDir, "my-feature");
+    expect(status).toBe("updated");
 
     const content = await readFile(
       join(tmpDir, ".vscode", "tasks.json"),
@@ -156,7 +159,7 @@ describe("writeWorktreeTasksFile", () => {
     expect(parsed.tasks[1].label).toBe("Launch Claude");
   });
 
-  it("skips if Launch Claude task already exists", async () => {
+  it("returns 'unchanged' if Launch Claude task already exists", async () => {
     const existing = {
       version: "2.0.0",
       tasks: [
@@ -170,7 +173,8 @@ describe("writeWorktreeTasksFile", () => {
       originalContent,
     );
 
-    await writeWorktreeTasksFile(tmpDir, "my-feature");
+    const status = await writeWorktreeTasksFile(tmpDir, "my-feature");
+    expect(status).toBe("unchanged");
 
     const content = await readFile(
       join(tmpDir, ".vscode", "tasks.json"),
@@ -178,5 +182,33 @@ describe("writeWorktreeTasksFile", () => {
     );
     // File should be untouched
     expect(content).toBe(originalContent);
+  });
+});
+
+describe("reloadIdeWindow", () => {
+  const mockExecFile = vi.mocked(execFile);
+
+  beforeEach(() => {
+    mockExecFile.mockClear();
+  });
+
+  it("calls osascript with the bundle ID", async () => {
+    await reloadIdeWindow("com.google.antigravity");
+
+    expect(mockExecFile).toHaveBeenCalledWith(
+      "osascript",
+      expect.arrayContaining([expect.stringContaining("com.google.antigravity")]),
+      expect.any(Function),
+    );
+  });
+
+  it("logs warning on failure instead of throwing", async () => {
+    mockExecFile.mockImplementationOnce((_cmd, _args, cb) => {
+      (cb as Function)(new Error("accessibility denied"), "", "");
+      return undefined as never;
+    });
+
+    // Should not throw
+    await expect(reloadIdeWindow("com.microsoft.VSCode")).resolves.toBeUndefined();
   });
 });

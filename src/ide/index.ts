@@ -1,8 +1,11 @@
 // ide module — configurable IDE launcher (code, agy, cursor, etc.)
 
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
 
 export type IdeConfig = {
   command: string;
@@ -57,6 +60,8 @@ const LAUNCH_CLAUDE_TASK = {
   problemMatcher: [] as string[],
 };
 
+export type TasksFileStatus = "created" | "updated" | "unchanged";
+
 /**
  * Ensure a "Launch Claude" task exists in the worktree's .vscode/tasks.json.
  * Creates the file if missing, or merges the task into an existing file.
@@ -64,7 +69,7 @@ const LAUNCH_CLAUDE_TASK = {
 export async function writeWorktreeTasksFile(
   worktreePath: string,
   _worktreeName: string,
-): Promise<void> {
+): Promise<TasksFileStatus> {
   const tasksPath = join(worktreePath, ".vscode", "tasks.json");
 
   // Try to read existing tasks.json
@@ -81,12 +86,13 @@ export async function writeWorktreeTasksFile(
     const tasks = Array.isArray(existing.tasks) ? existing.tasks : [];
     if (tasks.some((t) => t.label === "Launch Claude")) {
       console.log(`[ide] "Launch Claude" task already exists in tasks.json`);
-      return; // Already has the task
+      return "unchanged";
     }
     tasks.push(LAUNCH_CLAUDE_TASK);
     existing.tasks = tasks;
     await writeFile(tasksPath, JSON.stringify(existing, null, 2) + "\n");
     console.log(`[ide] Added "Launch Claude" task to existing tasks.json`);
+    return "updated";
   } else {
     const tasksJson = {
       version: "2.0.0",
@@ -95,6 +101,35 @@ export async function writeWorktreeTasksFile(
     await mkdir(join(worktreePath, ".vscode"), { recursive: true });
     await writeFile(tasksPath, JSON.stringify(tasksJson, null, 2) + "\n");
     console.log(`[ide] Created .vscode/tasks.json with "Launch Claude" task`);
+    return "created";
+  }
+}
+
+/**
+ * Reload an IDE window via AppleScript.
+ * Activates the app by bundle ID, opens Command Palette, types "Reload Window", presses Enter.
+ */
+export async function reloadIdeWindow(bundleId: string): Promise<void> {
+  const script = `
+    tell application id "${bundleId}"
+      activate
+    end tell
+    delay 1
+    tell application "System Events"
+      keystroke "p" using {command down, shift down}
+      delay 0.5
+      keystroke "Reload Window"
+      delay 0.3
+      key code 36
+    end tell
+  `;
+  try {
+    await execFileAsync("osascript", ["-e", script]);
+    console.log(`[ide] Reloaded IDE window`);
+  } catch {
+    console.log(
+      `[ide] Could not reload IDE window automatically. Use Command Palette > "Developer: Reload Window"`,
+    );
   }
 }
 

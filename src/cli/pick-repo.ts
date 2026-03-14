@@ -6,7 +6,7 @@ import { join } from "node:path";
 import * as readline from "node:readline/promises";
 import { promisify } from "node:util";
 import { validateRepo, createWorktree } from "../git/index.js";
-import { detectIde, launchIde, writeWorktreeTasksFile } from "../ide/index.js";
+import { detectIde, launchIde, writeWorktreeTasksFile, reloadIdeWindow } from "../ide/index.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -86,7 +86,7 @@ try {
 }
 
 // --- Set up worktree IDE config ---
-await writeWorktreeTasksFile(worktreePath, worktreeName);
+const tasksStatus = await writeWorktreeTasksFile(worktreePath, worktreeName);
 
 // --- Open IDE window ---
 const ide = detectIde();
@@ -94,6 +94,14 @@ if (ide) {
   launchIde(ide, worktreePath);
 } else {
   console.log(`[pick-repo] Could not detect IDE. Open manually: ${worktreePath}`);
+}
+
+// --- Reload IDE window if tasks.json was updated in an existing file ---
+if (tasksStatus === "updated") {
+  const bundleId = process.env.__CFBundleIdentifier;
+  if (bundleId) {
+    await reloadIdeWindow(bundleId);
+  }
 }
 
 // --- Prompt to add .worktrees to .gitignore ---
