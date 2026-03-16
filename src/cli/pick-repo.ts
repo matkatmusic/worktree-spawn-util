@@ -43,7 +43,7 @@ async function pickFolder(): Promise<string | null> {
 
 // --- Parse args ---
 const cliArgs = process.argv.slice(2);
-const visible = cliArgs.includes("--visible");
+const visible = cliArgs.includes("--inspectHB");
 const rawName = cliArgs.find((a) => !a.startsWith("--")) ?? "";
 
 if (!rawName.trim()) {

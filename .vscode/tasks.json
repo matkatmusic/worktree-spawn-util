@@ -5,7 +5,7 @@
       "label": "Worktree: Pick Repository",
       "type": "shell",
       "command": "node",
-      "args": ["${workspaceFolder}/dist/cli/pick-repo.js", "--visible", "${input:worktreeName}"],
+      "args": ["${workspaceFolder}/dist/cli/pick-repo.js", "--inspectHB", "${input:worktreeName}"],
       "presentation": {
         "reveal": "always",
         "panel": "new",
