@@ -3,8 +3,8 @@
 // heartbeat CLI — thin wrapper around heartbeat/client.ts
 
 import { join } from "node:path";
-import { getSocketPath, getSocketDir } from "../socket/index.js";
-import { parseArgs, sendHeartbeat } from "../heartbeat/client.js";
+import { getSocketPath, getSocketDir } from "../socket.js";
+import { parseArgs, sendHeartbeat } from "../daemon-client.js";
 
 const HEARTBEAT_INTERVAL_MS = 5_000;
 

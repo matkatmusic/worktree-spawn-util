@@ -3,7 +3,7 @@ import { mkdtemp, rm, realpath } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createServer, type Server } from "node:net";
-import { parseArgs, sendHeartbeat } from "../src/heartbeat/client.js";
+import { parseArgs, sendHeartbeat } from "../src/daemon-client.js";
 
 describe("parseArgs", () => {
   it("parses --repo-root and --worktree", () => {

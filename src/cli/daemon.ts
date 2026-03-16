@@ -4,8 +4,8 @@
 
 import { unlinkSync } from "node:fs";
 import { join } from "node:path";
-import { getSocketPath, getSocketDir, ensureSocketDir, cleanStaleSocket } from "../socket/index.js";
-import { createDaemonServer } from "../daemon/server.js";
+import { getSocketPath, getSocketDir, ensureSocketDir, cleanStaleSocket } from "../socket.js";
+import { createDaemonServer } from "../daemon-server.js";
 
 const args = process.argv.slice(2);
 const silent = args.includes("--silent");

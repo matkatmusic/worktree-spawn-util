@@ -3,7 +3,7 @@ import { mkdtemp, rm, readFile, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawn, execFile } from "node:child_process";
-import { detectIde, launchIde, writeWorktreeTasksFile, reloadIdeWindow } from "../src/ide/index.js";
+import { detectIde, launchIde, writeWorktreeTasksFile, reloadIdeWindow } from "../src/ide.js";
 
 vi.mock("node:child_process", () => ({
   spawn: vi.fn(() => ({ unref: vi.fn() })),

@@ -6,9 +6,9 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as readline from "node:readline/promises";
 import { promisify } from "node:util";
-import { validateRepo, createWorktree } from "../git/index.js";
-import { detectIde, launchIde, writeWorktreeTasksFile } from "../ide/index.js";
-import { getSocketPath, ensureSocketDir, isSocketAlive, getDaemonSessionName } from "../socket/index.js";
+import { validateRepo, createWorktree } from "../git.js";
+import { detectIde, launchIde, writeWorktreeTasksFile } from "../ide.js";
+import { getSocketPath, ensureSocketDir, isSocketAlive, getDaemonSessionName } from "../socket.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);

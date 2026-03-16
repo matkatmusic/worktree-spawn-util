@@ -3,7 +3,7 @@ import { mkdtemp, rm, access, realpath } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { simpleGit } from "simple-git";
-import { parseWorktreeList, createWorktree } from "../src/git/index.js";
+import { parseWorktreeList, createWorktree } from "../src/git.js";
 
 describe("parseWorktreeList", () => {
   it("parses normal worktree entries", () => {

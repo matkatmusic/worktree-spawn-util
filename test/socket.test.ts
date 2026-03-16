@@ -10,7 +10,7 @@ import {
   getDaemonSessionName,
   isSocketAlive,
   cleanStaleSocket,
-} from "../src/socket/index.js";
+} from "../src/socket.js";
 
 describe("getSocketDir", () => {
   it("returns a path under /tmp/ with wtsu prefix and uid", () => {

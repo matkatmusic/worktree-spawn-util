@@ -3,7 +3,7 @@ import { mkdtemp, rm, realpath } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createConnection } from "node:net";
-import { createDaemonServer, type DaemonHandle } from "../src/daemon/server.js";
+import { createDaemonServer, type DaemonHandle } from "../src/daemon-server.js";
 
 describe("createDaemonServer", () => {
   let tmpDir: string;

@@ -3,7 +3,7 @@
 import { execFile, spawn } from "node:child_process";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { getDaemonSessionName } from "../socket/index.js";
+import { getDaemonSessionName } from "./socket.js";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
@@ -106,7 +106,7 @@ function addHeartbeatTask(existing: TasksJsonFile, worktreeName: string, repoRoo
   const heartbeatTask: Task = {
     label: heartbeatLabel,
     type: "shell",
-    command: `node "${join(__dirname, "..", "cli", "heartbeat.js")}" --repo-root "${repoRoot}" --worktree "${worktreeName}"`,
+    command: `node "${join(__dirname, "cli", "heartbeat.js")}" --repo-root "${repoRoot}" --worktree "${worktreeName}"`,
     runOptions: { runOn: "folderOpen" },
     presentation: {
       reveal: visible ? "always" : "never",
