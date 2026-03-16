@@ -32,11 +32,34 @@ else
     fi
 fi
 
-# 2. Install npm dependencies
+# 2. Check for tmux
+if command -v tmux &>/dev/null; then
+    echo "tmux found: $(tmux -V)"
+else
+    echo "tmux is not installed."
+
+    # Ensure Homebrew is available (may have been installed in step 1)
+    if ! command -v brew &>/dev/null; then
+        echo "Homebrew is required to install tmux."
+        echo "Please install tmux manually: https://github.com/tmux/tmux/wiki/Installing"
+        exit 1
+    fi
+
+    read -rp "Install tmux via Homebrew? (y/n) " install_tmux
+    if [[ "$install_tmux" =~ ^[Yy]$ ]]; then
+        echo "Installing tmux..."
+        brew install tmux
+    else
+        echo "tmux is required. Please install manually."
+        exit 1
+    fi
+fi
+
+# 3. Install npm dependencies
 echo ""
 echo "Running npm install..."
 npm install
 
-# 3. Success
+# 4. Success
 echo ""
 echo "Setup complete! You can now use the VS Code tasks."

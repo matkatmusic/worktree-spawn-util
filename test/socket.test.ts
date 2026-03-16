@@ -7,6 +7,7 @@ import {
   getSocketDir,
   ensureSocketDir,
   getSocketPath,
+  getDaemonSessionName,
   isSocketAlive,
   cleanStaleSocket,
 } from "../src/socket/index.js";
@@ -88,6 +89,53 @@ describe("getSocketPath", () => {
   it("total path length is under 104 chars (macOS socket limit)", async () => {
     const sockPath = await getSocketPath(tmpDir);
     expect(sockPath.length).toBeLessThan(104);
+  });
+});
+
+describe("getDaemonSessionName", () => {
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await realpath(await mkdtemp(join(tmpdir(), "session-test-")));
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("returns a name starting with wtsu_daemon_", async () => {
+    const name = await getDaemonSessionName(tmpDir);
+    expect(name).toMatch(/^wtsu_daemon_[0-9a-f]{12}$/);
+  });
+
+  it("is deterministic — same input produces same output", async () => {
+    const name1 = await getDaemonSessionName(tmpDir);
+    const name2 = await getDaemonSessionName(tmpDir);
+    expect(name1).toBe(name2);
+  });
+
+  it("produces different names for different repo roots", async () => {
+    const tmpDir2 = await realpath(await mkdtemp(join(tmpdir(), "session-test2-")));
+    try {
+      const name1 = await getDaemonSessionName(tmpDir);
+      const name2 = await getDaemonSessionName(tmpDir2);
+      expect(name1).not.toBe(name2);
+    } finally {
+      await rm(tmpDir2, { recursive: true, force: true });
+    }
+  });
+
+  it("contains only tmux-safe characters (alphanumeric + underscore)", async () => {
+    const name = await getDaemonSessionName(tmpDir);
+    expect(name).toMatch(/^[a-zA-Z0-9_]+$/);
+  });
+
+  it("resolves symlinks — symlink and real path produce same name", async () => {
+    const symlinkPath = join(tmpDir, "link-to-self");
+    await symlink(tmpDir, symlinkPath);
+    const nameFromReal = await getDaemonSessionName(tmpDir);
+    const nameFromLink = await getDaemonSessionName(symlinkPath);
+    expect(nameFromReal).toBe(nameFromLink);
   });
 });
 

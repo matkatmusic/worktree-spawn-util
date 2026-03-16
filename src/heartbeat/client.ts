@@ -1,6 +1,7 @@
 // heartbeat/client — heartbeat sending logic extracted for testability
 
 import { createConnection } from "node:net";
+import { appendFile } from "node:fs/promises";
 
 /** Parse --repo-root and --worktree from CLI args. */
 export function parseArgs(args: string[]): { repoRoot: string; worktree: string } {
@@ -23,7 +24,7 @@ export function parseArgs(args: string[]): { repoRoot: string; worktree: string 
 let heartbeatCount = 0;
 
 /** Send a single heartbeat message to the daemon over a Unix socket. */
-export function sendHeartbeat(socketPath: string, worktreeName: string, silent?: boolean): void {
+export function sendHeartbeat(socketPath: string, worktreeName: string, silent?: boolean, logFile?: string): void {
   heartbeatCount++;
   const seq = heartbeatCount;
   const client = createConnection({ path: socketPath }, () => {
@@ -31,6 +32,9 @@ export function sendHeartbeat(socketPath: string, worktreeName: string, silent?:
     client.write(msg, () => {
       if (!silent) {
         console.log(`[heartbeat] Sent #${seq} → "${worktreeName}"`);
+      }
+      if (logFile) {
+        appendFile(logFile, `[${new Date().toISOString()}] [heartbeat] Sent #${seq} → "${worktreeName}"\n`).catch(() => {});
       }
       client.end();
     });

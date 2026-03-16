@@ -1,0 +1,281 @@
+================================================================================
+HEARTBEAT SYSTEM — CROSS-REVIEWER SYNTHESIS
+================================================================================
+Reviewers: Claude (Opus), Codex (GPT-5.4), Gemini
+Date synthesized: 2026-03-14
+
+Claude produced 13 findings (2C, 3H, 5M, 3L, 3N).
+Codex produced 5 findings (0C, 1H, 2M, 2L).
+Gemini produced 7 findings (1C, 1H, 1M, 2L, 2N).
+
+Total unique findings after deduplication: 16
+
+================================================================================
+SECTION 1: FINDINGS AGREED ON BY 2+ REVIEWERS (cross-validated)
+================================================================================
+
+These are the highest-confidence issues. Each was independently identified
+by multiple reviewers without coordination.
+
+--- CRITICAL / HIGH ---
+
+#1  Command injection / shell-unsafe repo names in tmux + VS Code tasks
+    Severity: Critical (Gemini, Claude) / High (Codex)
+    Files: src/cli/pick-repo.ts:104, src/ide/index.ts:156, src/ide/index.ts:107,129
+    Flagged by: ALL THREE REVIEWERS
+    What: basename(repoRoot) is interpolated directly into shell command
+          strings for tmux session names and VS Code task commands. Repo
+          paths containing shell metacharacters (spaces, semicolons, $, etc.)
+          can cause command injection or broken tmux sessions.
+    Why:  Arbitrary shell execution from a maliciously named directory. Even
+          benign names with periods/colons break tmux (it rejects those chars
+          in session names). Two repos with the same basename collide.
+    Fix:  Create a shared getDaemonSessionName(repoRoot) helper that:
+          (a) derives from a stable hash (matching socket path strategy),
+          (b) sanitizes invalid chars (.replace(/[\.:$ ;&|`()]/g, '_')),
+          (c) is used in both pick-repo.ts and ide/index.ts.
+          For VS Code tasks, use the args array format instead of inlining
+          into command strings, or properly quote all interpolated values.
+
+#2  Shared log file (daemon.log) — all repos write to same file
+    Severity: High (Claude) / Low (Codex, Gemini — as Medium)
+    Files: src/cli/daemon.ts:30, src/cli/heartbeat.ts:23
+    Flagged by: ALL THREE REVIEWERS
+    What: Both daemon and heartbeat processes compute
+          join(getSocketDir(), "daemon.log") and write with appendFileSync.
+          Multiple repos running concurrently interleave their logs into
+          one file.
+    Why:  Breaks the per-repo isolation the socket design established. Makes
+          debugging race conditions or cleanup failures nearly impossible.
+    Fix:  Scope log file per repository: const logFile = `${socketPath}.log`
+          or derive from the same repo hash as the socket.
+
+#3  tmux session name duplication — logic repeated in two files
+    Severity: High (Gemini, Claude) / High (Codex — combined with #1)
+    Files: src/cli/pick-repo.ts:103, src/ide/index.ts:156
+    Flagged by: ALL THREE REVIEWERS
+    What: Session name `${basename(repoRoot)}_daemon` is constructed inline
+          in two separate locations with no shared helper. No sanitization
+          of periods, colons, or spaces.
+    Why:  tmux rejects names with periods/colons. Duplicate basenames across
+          repos collide. The monitor task may attach to the wrong daemon.
+    Fix:  Extract to a shared getDaemonSessionName(repoRoot) utility.
+          (This is the same fix as #1 — they are related.)
+
+#4  Non-null assertion on optional repoRoot when visible=true
+    Severity: High (Claude) / Low (Codex)
+    Files: src/ide/index.ts:201-202, src/ide/index.ts:222-223
+    Flagged by: Claude, Codex
+    What: repoRoot! is used with a non-null assertion but repoRoot is typed
+          as optional. Calling writeWorktreeTasksFile(path, name, undefined,
+          true) would produce a task referencing "undefined_daemon".
+    Why:  Silent malfunction — runtime crash or nonsensical task definition.
+    Fix:  Either make repoRoot required when visible=true (enforce via types
+          or runtime check), or guard with if (visible && repoRoot).
+
+#5  Silent continuation after socket poll timeout
+    Severity: Medium (Claude, Codex)
+    Files: src/cli/pick-repo.ts:119-127
+    Flagged by: Claude, Codex
+    What: The poll loop waits up to 5s for the daemon socket. If it never
+          comes alive, execution continues silently — writing tasks and
+          opening the IDE as if the daemon were healthy.
+    Why:  Daemon startup failures become invisible. User assumes automatic
+          cleanup is active when it is not.
+    Fix:  After the loop, check isSocketAlive one final time. If still dead,
+          log a hard warning or exit non-zero. At minimum:
+          console.warn("[pick-repo] WARNING: Daemon socket not ready after 5s")
+
+#6  Missing semicolon on logToFile call
+    Severity: Nit (Claude, Gemini)
+    Files: src/daemon/server.ts:121-122
+    Flagged by: Claude, Gemini
+    What: logToFile(...) call missing trailing semicolon. ASI handles it but
+          it is inconsistent with the rest of the codebase.
+    Fix:  Add the semicolon.
+
+--- MEDIUM ---
+
+#7  Synchronous I/O (appendFileSync) in event loops
+    Severity: Low (Gemini) / Medium-implied (Claude — via log contention)
+    Files: src/daemon/server.ts:54, src/heartbeat/client.ts:38
+    Flagged by: Claude, Gemini
+    What: appendFileSync blocks the Node event loop on every heartbeat.
+    Why:  Anti-pattern for async network servers. Low impact at current
+          traffic (5s intervals) but limits concurrency.
+    Fix:  Switch to fs.promises.appendFile() or use a writable stream.
+
+
+================================================================================
+SECTION 2: UNIQUE FINDINGS (single reviewer)
+================================================================================
+
+These were flagged by only one reviewer. They may still be valid and should
+be evaluated individually.
+
+--- FROM CLAUDE ONLY ---
+
+#8  Race condition: async cleanup during Map iteration
+    Severity: Critical (Claude)
+    File: src/daemon/server.ts:151-155
+    What: for...of iterates heartbeats Map and calls async cleanupWorktree()
+          which deletes from the Map. cleanupWorktree is not awaited, so
+          multiple async cleanups can overlap. Next interval tick can fire
+          while cleanups are in flight, potentially triggering duplicate
+          git worktree remove --force and tmux kill-session calls.
+    Why:  Double cleanup of same worktree, or removing a worktree that was
+          re-registered between check and completion.
+    Fix:  Collect expired worktrees into an array first, delete from map
+          immediately, then run cleanups. Or add a cleaningUp: Set<string>
+          guard to skip worktrees already being cleaned.
+    Note: Neither Codex nor Gemini flagged this. The ES2015+ spec does
+          guarantee safe deletion during Map iteration, but the async
+          concurrency concern is distinct from the iteration safety question.
+
+#9  Heartbeat worktree name not quoted in task command
+    Severity: High (Claude)
+    File: src/ide/index.ts:129
+    What: --worktree ${worktreeName} lacks quotes in the command string,
+          while --repo-root "${repoRoot}" is quoted.
+    Why:  Worktree names with spaces would break the command.
+    Fix:  Quote it: --worktree "${worktreeName}"
+
+#10 Session header format inconsistent with logToFile format
+    Severity: Medium (Claude)
+    File: src/daemon/server.ts:62-70
+    What: The session header block does not use the logToFile() helper and
+          has a different format (no [timestamp] prefix).
+    Fix:  Use logToFile() for the header lines, or accept the format
+          difference as intentional for readability.
+
+#11 Log file grows without bound
+    Severity: Medium (Claude)
+    File: src/daemon/server.ts:53-54
+    What: appendFileSync with no rotation. At 5s heartbeat intervals, log
+          grows ~17 KB/hour (~400 KB/day) per worktree.
+    Fix:  Implement simple size-based rotation or document that logs are in
+          /tmp and cleared on reboot.
+
+#12 reloadIdeWindow is exported but no longer called
+    Severity: Low (Claude)
+    File: src/ide/index.ts:236-258
+    What: Function was removed from pick-repo.ts imports but the function
+          and its tests remain.
+    Fix:  Remove the dead code and its tests, or document why it is retained.
+
+#13 heartbeatCount module-level mutable state
+    Severity: Low (Claude)
+    File: src/heartbeat/client.ts:24
+    What: Module-level let variable persists across test cases, making tests
+          potentially order-dependent.
+    Fix:  Export a resetHeartbeatCount() for tests, or accept typeof assertion.
+
+#14 Fallback spawn doesn't pass --silent flag
+    Severity: Low (Claude)
+    File: src/cli/pick-repo.ts (fallback spawn path)
+    What: When tmux launch fails and falls back to detached spawn, --silent
+          is not forwarded to the daemon.
+    Fix:  Low priority consistency fix.
+
+--- FROM CODEX ONLY ---
+
+#15 --visible mode is append-only, not idempotent
+    Severity: Medium (Codex)
+    Files: src/ide/index.ts:121, 126, 194
+    What: If a Heartbeat task already exists, addHeartbeatTask returns early
+          without reconciling reveal/panel/group fields. Rerunning with a
+          different visibility mode leaves stale task config.
+    Why:  You can end up with a visible monitor task plus an old hidden
+          heartbeat task — inconsistent with the requested mode.
+    Fix:  When a task with the same label exists, update fields in place
+          instead of returning. Add tests for toggling visible on existing
+          tasks.json.
+
+--- FROM GEMINI ONLY ---
+
+#16 Blocking interactive prompt in RunMeFirst.sh
+    Severity: Nit (Gemini)
+    File: RunMeFirst.sh:48
+    What: read -rp prompts for tmux installation. Hangs in non-interactive
+          CI pipelines.
+    Fix:  Guard with if [ -t 0 ]; then before prompting, or add a -y flag.
+
+
+================================================================================
+SECTION 3: DISAGREEMENTS
+================================================================================
+
+No direct contradictions were found between reviewers. The main variance is
+in severity calibration:
+
+1. Command injection: Gemini and Claude rated Critical; Codex rated High.
+   The difference is whether execFileAsync's argument passing is considered
+   "safe enough" for pick-repo.ts (Codex noted this nuance) vs. the VS Code
+   task command field which IS shell-interpreted (all agree this is unsafe).
+
+2. Shared log file: Claude rated High; Codex and Gemini rated Low/Medium.
+   The actual impact depends on whether multi-repo concurrent usage is a
+   realistic scenario for this tool.
+
+3. Race condition in async cleanup: Only Claude flagged this as Critical.
+   Codex and Gemini did not identify it. The concern is valid (unawaited
+   async functions during iteration can cause duplicate cleanups) but
+   requires specific timing conditions to manifest.
+
+4. repoRoot non-null assertion: Claude rated High; Codex rated Low.
+   Claude focused on the silent malfunction; Codex focused on the API
+   type signature mismatch.
+
+
+================================================================================
+SECTION 4: PRIORITY ACTION ITEMS
+================================================================================
+
+Recommended fix order based on cross-validation confidence and severity:
+
+1. [CRITICAL] Create getDaemonSessionName() helper — sanitize, deduplicate,
+   hash-based uniqueness. Fixes #1, #3, and partially #9.
+   Touches: src/cli/pick-repo.ts, src/ide/index.ts
+
+2. [CRITICAL] Guard async cleanup race — collect expired keys, delete from
+   map, then run cleanups. Fixes #8.
+   Touches: src/daemon/server.ts
+
+3. [HIGH] Scope log file per repo — use ${socketPath}.log. Fixes #2.
+   Touches: src/cli/daemon.ts, src/cli/heartbeat.ts
+
+4. [HIGH] Fix repoRoot non-null assertion — make required or guard. Fixes #4.
+   Touches: src/ide/index.ts
+
+5. [HIGH] Quote worktree name in task command. Fixes #9.
+   Touches: src/ide/index.ts
+
+6. [MEDIUM] Add timeout failure path for socket poll. Fixes #5.
+   Touches: src/cli/pick-repo.ts
+
+7. [MEDIUM] Make --visible mode idempotent. Fixes #15.
+   Touches: src/ide/index.ts
+
+8. [MEDIUM] Switch appendFileSync to async. Fixes #7.
+   Touches: src/daemon/server.ts, src/heartbeat/client.ts
+
+9. [LOW-NIT] Remaining items (#6, #10-14, #16) can be addressed in a
+   cleanup pass.
+
+================================================================================
+SUMMARY STATISTICS
+================================================================================
+Total unique findings:     16
+Cross-validated (2+ agree): 7   (highest confidence)
+Claude-only:                7
+Codex-only:                 1
+Gemini-only:                1
+Disagreements:              0   (severity calibration varies, no contradictions)
+
+Severity distribution:
+  Critical:  2  (#1 command injection, #8 async race)
+  High:      3  (#2 shared logs, #4 non-null assertion, #9 unquoted arg)
+  Medium:    4  (#5 poll timeout, #7 sync I/O, #11 log rotation, #15 idempotency)
+  Low:       4  (#10 header format, #12 dead code, #13 mutable state, #14 --silent)
+  Nit:       3  (#6 semicolon, #16 interactive prompt, implied N1-N3 from Claude)
+================================================================================

@@ -7,8 +7,8 @@ import { fileURLToPath } from "node:url";
 import * as readline from "node:readline/promises";
 import { promisify } from "node:util";
 import { validateRepo, createWorktree } from "../git/index.js";
-import { detectIde, launchIde, writeWorktreeTasksFile, reloadIdeWindow } from "../ide/index.js";
-import { getSocketPath, ensureSocketDir, isSocketAlive } from "../socket/index.js";
+import { detectIde, launchIde, writeWorktreeTasksFile } from "../ide/index.js";
+import { getSocketPath, ensureSocketDir, isSocketAlive, getDaemonSessionName } from "../socket/index.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -41,8 +41,10 @@ async function pickFolder(): Promise<string | null> {
   }
 }
 
-// --- Worktree name ---
-const rawName = process.argv[2] ?? "";
+// --- Parse args ---
+const cliArgs = process.argv.slice(2);
+const visible = cliArgs.includes("--visible");
+const rawName = cliArgs.find((a) => !a.startsWith("--")) ?? "";
 
 if (!rawName.trim()) {
   console.error("[pick-repo] No worktree name provided.");
@@ -97,21 +99,57 @@ const daemonAlive = await isSocketAlive(socketPath);
 if (!daemonAlive) {
   ensureSocketDir();
   const daemonPath = join(__dirname, "daemon.js");
-  const daemonProc = spawn("node", [daemonPath, selection.repoRoot], {
-    detached: true,
-    stdio: "ignore",
-  });
-  daemonProc.unref();
-  console.log(`[pick-repo] Started daemon (PID ${daemonProc.pid}) for ${selection.repoRoot}`);
+  const sessionName = await getDaemonSessionName(selection.repoRoot);
+  const daemonCmd = `node "${daemonPath}" "${selection.repoRoot}"`;
 
-  // Brief wait for daemon to bind the socket
-  await new Promise((resolve) => setTimeout(resolve, 500));
+  try {
+    await execFileAsync("tmux", ["new-session", "-d", "-s", sessionName, daemonCmd]);
+    console.log(`[pick-repo] Started daemon in tmux session "${sessionName}"`);
+  } catch {
+    // tmux may not be available — fall back to detached spawn
+    const daemonProc = spawn("node", [daemonPath, selection.repoRoot], {
+      detached: true,
+      stdio: "ignore",
+    });
+    daemonProc.unref();
+    console.log(`[pick-repo] Started daemon (PID ${daemonProc.pid}) for ${selection.repoRoot}`);
+  }
+
+  // Poll until daemon socket is live (max 5s)
+  const pollStart = Date.now();
+  while (Date.now() - pollStart < 5000) {
+    if (await isSocketAlive(socketPath)) {
+      console.log("[pick-repo] Daemon socket is live");
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  if (!(await isSocketAlive(socketPath))) {
+    console.warn("[pick-repo] WARNING: Daemon socket not ready after 5s — worktree cleanup may not work");
+  }
 } else {
   console.log("[pick-repo] Daemon already running for this repo");
 }
 
+// --- Create worktree tmux session (Claude top, terminal bottom) ---
+try {
+  await execFileAsync("tmux", [
+    "new-session", "-d", "-s", worktreeName, "-c", worktreePath,
+    "claude", "--permission-mode", "plan",
+  ]);
+  await execFileAsync("tmux", [
+    "split-window", "-v", "-t", worktreeName, "-c", worktreePath,
+  ]);
+  await execFileAsync("tmux", [
+    "select-pane", "-t", `${worktreeName}:0.0`,
+  ]);
+  console.log(`[pick-repo] Created tmux session "${worktreeName}" with Claude + terminal`);
+} catch {
+  console.log(`[pick-repo] Could not create tmux session (may already exist)`);
+}
+
 // --- Set up worktree IDE config ---
-const tasksStatus = await writeWorktreeTasksFile(worktreePath, worktreeName, selection.repoRoot);
+const tasksStatus = await writeWorktreeTasksFile(worktreePath, worktreeName, selection.repoRoot, visible);
 
 // --- Open IDE window ---
 const ide = detectIde();
@@ -119,14 +157,6 @@ if (ide) {
   launchIde(ide, worktreePath);
 } else {
   console.log(`[pick-repo] Could not detect IDE. Open manually: ${worktreePath}`);
-}
-
-// --- Reload IDE window if tasks.json was updated in an existing file ---
-if (tasksStatus === "updated") {
-  const bundleId = process.env.__CFBundleIdentifier;
-  if (bundleId) {
-    await reloadIdeWindow(bundleId);
-  }
 }
 
 // --- Prompt to add .worktrees to .gitignore ---

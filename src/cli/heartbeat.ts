@@ -2,7 +2,8 @@
 
 // heartbeat CLI — thin wrapper around heartbeat/client.ts
 
-import { getSocketPath } from "../socket/index.js";
+import { join } from "node:path";
+import { getSocketPath, getSocketDir } from "../socket/index.js";
 import { parseArgs, sendHeartbeat } from "../heartbeat/client.js";
 
 const HEARTBEAT_INTERVAL_MS = 5_000;
@@ -19,6 +20,8 @@ if (!repoRoot || !worktree) {
 
 const socketPath = await getSocketPath(repoRoot);
 
+const logFile = join(getSocketDir(), "daemon.log");
+
 console.log(`[heartbeat] Starting for worktree "${worktree}" → ${socketPath}`);
-sendHeartbeat(socketPath, worktree, silent);
-setInterval(() => sendHeartbeat(socketPath, worktree, silent), HEARTBEAT_INTERVAL_MS);
+sendHeartbeat(socketPath, worktree, silent, logFile);
+setInterval(() => sendHeartbeat(socketPath, worktree, silent, logFile), HEARTBEAT_INTERVAL_MS);

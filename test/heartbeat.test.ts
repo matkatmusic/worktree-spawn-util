@@ -66,7 +66,10 @@ describe("sendHeartbeat", () => {
     sendHeartbeat(testSocketPath, "my-feature");
 
     const msg = await received;
-    expect(msg).toBe('{"type":"heartbeat","worktree":"my-feature"}\n');
+    const parsed = JSON.parse(msg.trim());
+    expect(parsed.type).toBe("heartbeat");
+    expect(parsed.worktree).toBe("my-feature");
+    expect(typeof parsed.seq).toBe("number");
   });
 
   it("sends message with correct worktree name", async () => {

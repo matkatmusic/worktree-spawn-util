@@ -43,6 +43,16 @@ export async function getSocketPath(repoRoot: string): Promise<string> {
 }
 
 /**
+ * Compute a deterministic, tmux-safe daemon session name for a repo root.
+ * Uses the same sha256 + realpath strategy as getSocketPath().
+ */
+export async function getDaemonSessionName(repoRoot: string): Promise<string> {
+  const resolved = await realpath(repoRoot);
+  const hash = createHash("sha256").update(resolved).digest("hex").slice(0, 12);
+  return `wtsu_daemon_${hash}`;
+}
+
+/**
  * Check if a daemon is alive at the given socket path.
  * Attempts a TCP connection; resolves true if connected, false on ECONNREFUSED or ENOENT.
  */

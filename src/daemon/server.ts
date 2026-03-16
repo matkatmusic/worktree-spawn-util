@@ -1,7 +1,8 @@
 // daemon/server — core daemon logic extracted for testability
 
 import { createServer, type Server, type Socket } from "node:net";
-import { unlinkSync } from "node:fs";
+import { appendFileSync, unlinkSync } from "node:fs";
+import { appendFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { EventEmitter } from "node:events";
@@ -13,6 +14,7 @@ export interface DaemonConfig {
   checkIntervalMs: number;
   idleShutdownMs: number;
   silent: boolean;
+  logFile?: string;
 }
 
 export interface DaemonHandle {
@@ -47,9 +49,30 @@ export function createDaemonServer(
   const events = new EventEmitter();
   let lastActivityTime = Date.now();
 
+  function logToFile(message: string): void {
+    if (!cfg.logFile) return;
+    appendFile(cfg.logFile, `[${new Date().toISOString()}] ${message}\n`).catch(() => {});
+  }
+
+  // Write session header
+  if (cfg.logFile) {
+    try {
+      appendFileSync(cfg.logFile,
+        `\n=== SESSION START ===\n` +
+        `worktree: (pending first heartbeat)\n` +
+        `launched: ${new Date().toISOString()}\n` +
+        `repo: ${repoRoot}\n` +
+        `socket: ${socketPath}\n` +
+        `========================\n`,
+      );
+    } catch {
+      // Best effort
+    }
+  }
+
   async function cleanupWorktree(worktreeName: string): Promise<void> {
     console.log(`[daemon] No heartbeat for "${worktreeName}" — triggering cleanup`);
-    heartbeats.delete(worktreeName);
+    logToFile(`[daemon] No heartbeat for "${worktreeName}" — triggering cleanup`);
     events.emit("cleanup", worktreeName);
 
     // Kill tmux session
@@ -88,10 +111,11 @@ export function createDaemonServer(
           if (msg.type === "heartbeat" && typeof msg.worktree === "string") {
             heartbeats.set(msg.worktree, Date.now());
             lastActivityTime = Date.now();
+            const seqStr = typeof msg.seq === "number" ? ` #${msg.seq}` : "";
             if (!cfg.silent) {
-              const seqStr = typeof msg.seq === "number" ? ` #${msg.seq}` : "";
               console.log(`[daemon] Received heartbeat${seqStr} ← "${msg.worktree}"`);
             }
+            logToFile(`[daemon] Received heartbeat${seqStr} ← "${msg.worktree}"`);
           }
         } catch {
           // Ignore malformed messages
@@ -106,6 +130,7 @@ export function createDaemonServer(
 
   server.listen(socketPath, () => {
     console.log(`[daemon] Listening on ${socketPath}`);
+    logToFile(`[daemon] Listening on ${socketPath}`);
     events.emit("listening");
   });
 
@@ -116,17 +141,24 @@ export function createDaemonServer(
     events.emit("error", err);
   });
 
-  const checkInterval = setInterval(() => {
+  const checkInterval = setInterval(async () => {
     const now = Date.now();
 
+    const expired: string[] = [];
     for (const [worktree, lastSeen] of heartbeats) {
       if (now - lastSeen > cfg.heartbeatTimeoutMs) {
-        cleanupWorktree(worktree);
+        expired.push(worktree);
       }
+    }
+    for (const worktree of expired) {
+      heartbeats.delete(worktree);
+      await cleanupWorktree(worktree);
     }
 
     if (heartbeats.size === 0 && now - lastActivityTime > cfg.idleShutdownMs) {
       console.log("[daemon] Idle — shutting down");
+      logToFile("[daemon] Idle — shutting down");
+      logToFile("=== SESSION END (idle-shutdown) ===");
       events.emit("idle-shutdown");
       shutdown();
     }

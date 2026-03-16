@@ -3,7 +3,8 @@
 // daemon CLI — thin wrapper around daemon/server.ts
 
 import { unlinkSync } from "node:fs";
-import { getSocketPath, ensureSocketDir, cleanStaleSocket } from "../socket/index.js";
+import { join } from "node:path";
+import { getSocketPath, getSocketDir, ensureSocketDir, cleanStaleSocket } from "../socket/index.js";
 import { createDaemonServer } from "../daemon/server.js";
 
 const args = process.argv.slice(2);
@@ -26,7 +27,8 @@ if (!cleaned) {
 }
 
 // --- Start server ---
-const handle = createDaemonServer(socketPath, repoRoot, { silent });
+const logFile = join(getSocketDir(), "daemon.log");
+const handle = createDaemonServer(socketPath, repoRoot, { silent, logFile });
 console.log(`[daemon] Watching repo: ${repoRoot}`);
 
 // --- Graceful shutdown ---

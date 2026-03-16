@@ -1,0 +1,1037 @@
+Debugger listening on ws://127.0.0.1:64744/9d65185c-0ff4-43ff-96a1-dc1685a3a84e
+For help, see: https://nodejs.org/en/docs/inspector
+Debugger attached.
+Reading prompt from stdin...
+OpenAI Codex v0.114.0 (research preview)
+--------
+workdir: /Users/matkatmusicllc/Programming/worktree-spawn-util
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: high
+reasoning summaries: none
+session id: 019cef92-a3c0-76c3-89d8-5072d866d9a1
+--------
+user
+## Code Review: Unix Domain Socket Heartbeat System
+
+### Summary of Changes
+
+A per-repo daemon listens on a Unix domain socket and receives heartbeats from VS Code background tasks. When an IDE window closes, heartbeats stop, and the daemon automatically cleans up the worktree and tmux session. Supporting infrastructure includes socket utilities, diagnostic logging, an optional --visible monitor mode, and 66 tests.
+
+### Files Changed (10 files, +199 -38 lines)
+
+- `.vscode/tasks.json` — Added --visible flag to pick-repo task args
+- `RunMeFirst.sh` — Added tmux installation check
+- `src/cli/daemon.ts` — Thin CLI wrapper, passes logFile and --silent flag
+- `src/cli/heartbeat.ts` — Thin CLI wrapper, passes logFile and --silent flag
+- `src/cli/pick-repo.ts` — Spawns daemon in tmux, polls socket readiness, passes --visible
+- `src/daemon/server.ts` — Core daemon logic with diagnostic file logging
+- `src/heartbeat/client.ts` — sendHeartbeat with seq counter and file logging
+- `src/ide/index.ts` — Added heartbeat task, daemon monitor task, --visible support
+- `test/heartbeat.test.ts` — Updated for seq field in messages
+- `test/ide.test.ts` — Added tests for heartbeat task, daemon monitor, visible mode
+
+### Architecture Context
+
+- The daemon runs in a named tmux session (`<repoBasename>_daemon`)
+- Socket path: `/tmp/wtsu-<uid>/<sha256(realpath(repoRoot)).slice(0,12)>.sock`
+- Heartbeat runs in VS Code integrated terminal (dies when IDE closes)
+- Daemon monitor task (`--visible` only) attaches to the daemon tmux session
+- Daemon self-shuts down after 60s with no tracked worktrees
+
+### Your Task
+
+Review the diff below for:
+
+1. **Correctness** — Logic bugs, race conditions, edge cases, error handling gaps
+2. **Security** — Socket permissions, path traversal, command injection in shell commands
+3. **Architecture** — Module boundaries, API design, testability, coupling
+4. **Reliability** — Crash recovery, stale state, resource leaks (file descriptors, intervals, sockets)
+5. **Code quality** — Dead code, unused imports, naming, consistency with existing patterns
+
+For each finding, specify:
+- **Severity**: Critical / High / Medium / Low / Nit
+- **File and line**: Where the issue is
+- **What**: Description of the problem
+- **Why**: Impact if not fixed
+- **Fix**: Suggested change
+
+### Diff
+
+diff --git a/.vscode/tasks.json b/.vscode/tasks.json
+index 4ce0207..ca109ea 100644
+--- a/.vscode/tasks.json
++++ b/.vscode/tasks.json
+@@ -5,7 +5,7 @@
+       "label": "Worktree: Pick Repository",
+       "type": "shell",
+       "command": "node",
+-      "args": ["${workspaceFolder}/dist/cli/pick-repo.js", "${input:worktreeName}"],
++      "args": ["${workspaceFolder}/dist/cli/pick-repo.js", "--visible", "${input:worktreeName}"],
+       "presentation": {
+         "reveal": "always",
+         "panel": "new",
+diff --git a/RunMeFirst.sh b/RunMeFirst.sh
+index faefcca..53d8f5d 100755
+--- a/RunMeFirst.sh
++++ b/RunMeFirst.sh
+@@ -32,11 +32,34 @@ else
+     fi
+ fi
+ 
+-# 2. Install npm dependencies
++# 2. Check for tmux
++if command -v tmux &>/dev/null; then
++    echo "tmux found: $(tmux -V)"
++else
++    echo "tmux is not installed."
++
++    # Ensure Homebrew is available (may have been installed in step 1)
++    if ! command -v brew &>/dev/null; then
++        echo "Homebrew is required to install tmux."
++        echo "Please install tmux manually: https://github.com/tmux/tmux/wiki/Installing"
++        exit 1
++    fi
++
++    read -rp "Install tmux via Homebrew? (y/n) " install_tmux
++    if [[ "$install_tmux" =~ ^[Yy]$ ]]; then
++        echo "Installing tmux..."
++        brew install tmux
++    else
++        echo "tmux is required. Please install manually."
++        exit 1
++    fi
++fi
++
++# 3. Install npm dependencies
+ echo ""
+ echo "Running npm install..."
+ npm install
+ 
+-# 3. Success
++# 4. Success
+ echo ""
+ echo "Setup complete! You can now use the VS Code tasks."
+diff --git a/src/cli/daemon.ts b/src/cli/daemon.ts
+index 18934bf..6e2833d 100644
+--- a/src/cli/daemon.ts
++++ b/src/cli/daemon.ts
+@@ -3,7 +3,8 @@
+ // daemon CLI — thin wrapper around daemon/server.ts
+ 
+ import { unlinkSync } from "node:fs";
+-import { getSocketPath, ensureSocketDir, cleanStaleSocket } from "../socket/index.js";
++import { join } from "node:path";
++import { getSocketPath, getSocketDir, ensureSocketDir, cleanStaleSocket } from "../socket/index.js";
+ import { createDaemonServer } from "../daemon/server.js";
+ 
+ const args = process.argv.slice(2);
+@@ -26,7 +27,8 @@ if (!cleaned) {
+ }
+ 
+ // --- Start server ---
+-const handle = createDaemonServer(socketPath, repoRoot, { silent });
++const logFile = join(getSocketDir(), "daemon.log");
++const handle = createDaemonServer(socketPath, repoRoot, { silent, logFile });
+ console.log(`[daemon] Watching repo: ${repoRoot}`);
+ 
+ // --- Graceful shutdown ---
+diff --git a/src/cli/heartbeat.ts b/src/cli/heartbeat.ts
+index 7922e19..06d9f7c 100644
+--- a/src/cli/heartbeat.ts
++++ b/src/cli/heartbeat.ts
+@@ -2,7 +2,8 @@
+ 
+ // heartbeat CLI — thin wrapper around heartbeat/client.ts
+ 
+-import { getSocketPath } from "../socket/index.js";
++import { join } from "node:path";
++import { getSocketPath, getSocketDir } from "../socket/index.js";
+ import { parseArgs, sendHeartbeat } from "../heartbeat/client.js";
+ 
+ const HEARTBEAT_INTERVAL_MS = 5_000;
+@@ -19,6 +20,8 @@ if (!repoRoot || !worktree) {
+ 
+ const socketPath = await getSocketPath(repoRoot);
+ 
++const logFile = join(getSocketDir(), "daemon.log");
++
+ console.log(`[heartbeat] Starting for worktree "${worktree}" → ${socketPath}`);
+-sendHeartbeat(socketPath, worktree, silent);
+-setInterval(() => sendHeartbeat(socketPath, worktree, silent), HEARTBEAT_INTERVAL_MS);
++sendHeartbeat(socketPath, worktree, silent, logFile);
++setInterval(() => sendHeartbeat(socketPath, worktree, silent, logFile), HEARTBEAT_INTERVAL_MS);
+diff --git a/src/cli/pick-repo.ts b/src/cli/pick-repo.ts
+index 4c8e66f..a5ceae2 100644
+--- a/src/cli/pick-repo.ts
++++ b/src/cli/pick-repo.ts
+@@ -2,12 +2,12 @@
+ 
+ import { execFile, spawn } from "node:child_process";
+ import { readFile, appendFile } from "node:fs/promises";
+-import { dirname, join } from "node:path";
++import { basename, dirname, join } from "node:path";
+ import { fileURLToPath } from "node:url";
+ import * as readline from "node:readline/promises";
+ import { promisify } from "node:util";
+ import { validateRepo, createWorktree } from "../git/index.js";
+-import { detectIde, launchIde, writeWorktreeTasksFile, reloadIdeWindow } from "../ide/index.js";
++import { detectIde, launchIde, writeWorktreeTasksFile } from "../ide/index.js";
+ import { getSocketPath, ensureSocketDir, isSocketAlive } from "../socket/index.js";
+ 
+ const __filename = fileURLToPath(import.meta.url);
+@@ -41,8 +41,10 @@ async function pickFolder(): Promise<string | null> {
+   }
+ }
+ 
+-// --- Worktree name ---
+-const rawName = process.argv[2] ?? "";
++// --- Parse args ---
++const cliArgs = process.argv.slice(2);
++const visible = cliArgs.includes("--visible");
++const rawName = cliArgs.find((a) => !a.startsWith("--")) ?? "";
+ 
+ if (!rawName.trim()) {
+   console.error("[pick-repo] No worktree name provided.");
+@@ -97,21 +99,38 @@ const daemonAlive = await isSocketAlive(socketPath);
+ if (!daemonAlive) {
+   ensureSocketDir();
+   const daemonPath = join(__dirname, "daemon.js");
+-  const daemonProc = spawn("node", [daemonPath, selection.repoRoot], {
+-    detached: true,
+-    stdio: "ignore",
+-  });
+-  daemonProc.unref();
+-  console.log(`[pick-repo] Started daemon (PID ${daemonProc.pid}) for ${selection.repoRoot}`);
++  const repoBasename = basename(selection.repoRoot);
++  const sessionName = `${repoBasename}_daemon`;
++  const daemonCmd = `node "${daemonPath}" "${selection.repoRoot}"`;
++
++  try {
++    await execFileAsync("tmux", ["new-session", "-d", "-s", sessionName, daemonCmd]);
++    console.log(`[pick-repo] Started daemon in tmux session "${sessionName}"`);
++  } catch {
++    // tmux may not be available — fall back to detached spawn
++    const daemonProc = spawn("node", [daemonPath, selection.repoRoot], {
++      detached: true,
++      stdio: "ignore",
++    });
++    daemonProc.unref();
++    console.log(`[pick-repo] Started daemon (PID ${daemonProc.pid}) for ${selection.repoRoot}`);
++  }
+ 
+-  // Brief wait for daemon to bind the socket
+-  await new Promise((resolve) => setTimeout(resolve, 500));
++  // Poll until daemon socket is live (max 5s)
++  const pollStart = Date.now();
++  while (Date.now() - pollStart < 5000) {
++    if (await isSocketAlive(socketPath)) {
++      console.log("[pick-repo] Daemon socket is live");
++      break;
++    }
++    await new Promise((resolve) => setTimeout(resolve, 100));
++  }
+ } else {
+   console.log("[pick-repo] Daemon already running for this repo");
+ }
+ 
+ // --- Set up worktree IDE config ---
+-const tasksStatus = await writeWorktreeTasksFile(worktreePath, worktreeName, selection.repoRoot);
++const tasksStatus = await writeWorktreeTasksFile(worktreePath, worktreeName, selection.repoRoot, visible);
+ 
+ // --- Open IDE window ---
+ const ide = detectIde();
+@@ -121,14 +140,6 @@ if (ide) {
+   console.log(`[pick-repo] Could not detect IDE. Open manually: ${worktreePath}`);
+ }
+ 
+-// --- Reload IDE window if tasks.json was updated in an existing file ---
+-if (tasksStatus === "updated") {
+-  const bundleId = process.env.__CFBundleIdentifier;
+-  if (bundleId) {
+-    await reloadIdeWindow(bundleId);
+-  }
+-}
+-
+ // --- Prompt to add .worktrees to .gitignore ---
+ const gitignorePath = join(selection.repoRoot, ".gitignore");
+ let gitignoreContent = "";
+diff --git a/src/daemon/server.ts b/src/daemon/server.ts
+index 7ed90a3..9991f78 100644
+--- a/src/daemon/server.ts
++++ b/src/daemon/server.ts
+@@ -1,7 +1,7 @@
+ // daemon/server — core daemon logic extracted for testability
+ 
+ import { createServer, type Server, type Socket } from "node:net";
+-import { unlinkSync } from "node:fs";
++import { appendFileSync, unlinkSync } from "node:fs";
+ import { execFile } from "node:child_process";
+ import { promisify } from "node:util";
+ import { EventEmitter } from "node:events";
+@@ -13,6 +13,7 @@ export interface DaemonConfig {
+   checkIntervalMs: number;
+   idleShutdownMs: number;
+   silent: boolean;
++  logFile?: string;
+ }
+ 
+ export interface DaemonHandle {
+@@ -47,8 +48,34 @@ export function createDaemonServer(
+   const events = new EventEmitter();
+   let lastActivityTime = Date.now();
+ 
++  function logToFile(message: string): void {
++    if (!cfg.logFile) return;
++    try {
++      appendFileSync(cfg.logFile, `[${new Date().toISOString()}] ${message}\n`);
++    } catch {
++      // Best effort — don't crash the daemon over logging
++    }
++  }
++
++  // Write session header
++  if (cfg.logFile) {
++    try {
++      appendFileSync(cfg.logFile,
++        `\n=== SESSION START ===\n` +
++        `worktree: (pending first heartbeat)\n` +
++        `launched: ${new Date().toISOString()}\n` +
++        `repo: ${repoRoot}\n` +
++        `socket: ${socketPath}\n` +
++        `========================\n`,
++      );
++    } catch {
++      // Best effort
++    }
++  }
++
+   async function cleanupWorktree(worktreeName: string): Promise<void> {
+     console.log(`[daemon] No heartbeat for "${worktreeName}" — triggering cleanup`);
++    logToFile(`[daemon] No heartbeat for "${worktreeName}" — triggering cleanup`);
+     heartbeats.delete(worktreeName);
+     events.emit("cleanup", worktreeName);
+ 
+@@ -88,10 +115,11 @@ export function createDaemonServer(
+           if (msg.type === "heartbeat" && typeof msg.worktree === "string") {
+             heartbeats.set(msg.worktree, Date.now());
+             lastActivityTime = Date.now();
++            const seqStr = typeof msg.seq === "number" ? ` #${msg.seq}` : "";
+             if (!cfg.silent) {
+-              const seqStr = typeof msg.seq === "number" ? ` #${msg.seq}` : "";
+               console.log(`[daemon] Received heartbeat${seqStr} ← "${msg.worktree}"`);
+             }
++            logToFile(`[daemon] Received heartbeat${seqStr} ← "${msg.worktree}"`)
+           }
+         } catch {
+           // Ignore malformed messages
+@@ -106,6 +134,7 @@ export function createDaemonServer(
+ 
+   server.listen(socketPath, () => {
+     console.log(`[daemon] Listening on ${socketPath}`);
++    logToFile(`[daemon] Listening on ${socketPath}`);
+     events.emit("listening");
+   });
+ 
+@@ -127,6 +156,8 @@ export function createDaemonServer(
+ 
+     if (heartbeats.size === 0 && now - lastActivityTime > cfg.idleShutdownMs) {
+       console.log("[daemon] Idle — shutting down");
++      logToFile("[daemon] Idle — shutting down");
++      logToFile("=== SESSION END (idle-shutdown) ===");
+       events.emit("idle-shutdown");
+       shutdown();
+     }
+diff --git a/src/heartbeat/client.ts b/src/heartbeat/client.ts
+index dae1c85..98ade9a 100644
+--- a/src/heartbeat/client.ts
++++ b/src/heartbeat/client.ts
+@@ -1,6 +1,7 @@
+ // heartbeat/client — heartbeat sending logic extracted for testability
+ 
+ import { createConnection } from "node:net";
++import { appendFileSync } from "node:fs";
+ 
+ /** Parse --repo-root and --worktree from CLI args. */
+ export function parseArgs(args: string[]): { repoRoot: string; worktree: string } {
+@@ -23,7 +24,7 @@ export function parseArgs(args: string[]): { repoRoot: string; worktree: string
+ let heartbeatCount = 0;
+ 
+ /** Send a single heartbeat message to the daemon over a Unix socket. */
+-export function sendHeartbeat(socketPath: string, worktreeName: string, silent?: boolean): void {
++export function sendHeartbeat(socketPath: string, worktreeName: string, silent?: boolean, logFile?: string): void {
+   heartbeatCount++;
+   const seq = heartbeatCount;
+   const client = createConnection({ path: socketPath }, () => {
+@@ -32,6 +33,11 @@ export function sendHeartbeat(socketPath: string, worktreeName: string, silent?:
+       if (!silent) {
+         console.log(`[heartbeat] Sent #${seq} → "${worktreeName}"`);
+       }
++      if (logFile) {
++        try {
++          appendFileSync(logFile, `[${new Date().toISOString()}] [heartbeat] Sent #${seq} → "${worktreeName}"\n`);
++        } catch { /* best effort */ }
++      }
+       client.end();
+     });
+   });
+diff --git a/src/ide/index.ts b/src/ide/index.ts
+index 23630af..3afbc59 100644
+--- a/src/ide/index.ts
++++ b/src/ide/index.ts
+@@ -2,7 +2,7 @@
+ 
+ import { execFile, spawn } from "node:child_process";
+ import { mkdir, readFile, writeFile } from "node:fs/promises";
+-import { dirname, join } from "node:path";
++import { basename, dirname, join } from "node:path";
+ import { fileURLToPath } from "node:url";
+ import { promisify } from "node:util";
+ 
+@@ -115,7 +115,7 @@ function addTmuxTask(existing: TasksJsonFile, worktreeName: string): Task[] {
+   return tasks;
+ }
+ 
+-function addHeartbeatTask(existing: TasksJsonFile, worktreeName: string, repoRoot: string): Task[] {
++function addHeartbeatTask(existing: TasksJsonFile, worktreeName: string, repoRoot: string, visible?: boolean): Task[] {
+   const tasks = Array.isArray(existing.tasks) ? existing.tasks : [];
+   const heartbeatLabel = `Heartbeat: ${worktreeName}`;
+   if (tasks.some((t) => t.label === heartbeatLabel)) {
+@@ -128,7 +128,12 @@ function addHeartbeatTask(existing: TasksJsonFile, worktreeName: string, repoRoo
+     type: "shell",
+     command: `node "${join(__dirname, "..", "cli", "heartbeat.js")}" --repo-root "${repoRoot}" --worktree ${worktreeName}`,
+     runOptions: { runOn: "folderOpen" },
+-    presentation: { reveal: "never", panel: "shared", group: `worktree-${worktreeName}`, focus: false },
++    presentation: {
++      reveal: visible ? "always" : "never",
++      panel: visible ? "dedicated" : "shared",
++      group: visible ? `daemon-${worktreeName}` : `worktree-${worktreeName}`,
++      focus: false,
++    },
+     isBackground: true,
+     problemMatcher: [],
+   };
+@@ -137,6 +142,28 @@ function addHeartbeatTask(existing: TasksJsonFile, worktreeName: string, repoRoo
+   return tasks;
+ }
+ 
++function addDaemonMonitorTask(existing: TasksJsonFile, worktreeName: string, repoRoot: string): Task[] {
++  const tasks = Array.isArray(existing.tasks) ? existing.tasks : [];
++  const label = "Daemon Monitor";
++  if (tasks.some((t) => t.label === label)) {
++    console.log(`[ide] "${label}" task already exists in tasks.json`);
++    return tasks;
++  }
++
++  const monitorTask: Task = {
++    label,
++    type: "shell",
++    command: `tmux attach -t ${basename(repoRoot)}_daemon`,
++    runOptions: { runOn: "folderOpen" },
++    presentation: { reveal: "always", panel: "dedicated", group: `daemon-${worktreeName}`, focus: false },
++    isBackground: true,
++    problemMatcher: [],
++  };
++
++  tasks.push(monitorTask);
++  return tasks;
++}
++
+ async function writeUpdatedTasks(tasksJson: TasksJsonFile, tasksPath: string): Promise<void> {
+   await writeFile(tasksPath, JSON.stringify(tasksJson, null, 2) + "\n");
+   console.log(`[ide] Updated tasks.json`);
+@@ -150,6 +177,7 @@ export async function writeWorktreeTasksFile(
+   worktreePath: string,
+   worktreeName: string,
+   repoRoot?: string,
++  visible?: boolean,
+ ): Promise<TasksFileStatus> {
+   const tasksPath = join(worktreePath, ".vscode", "tasks.json");
+ 
+@@ -168,7 +196,10 @@ export async function writeWorktreeTasksFile(
+     existing.tasks = addClaudeTask(existing, worktreeName);
+     existing.tasks = addTmuxTask(existing, worktreeName);
+     if (repoRoot) {
+-      existing.tasks = addHeartbeatTask(existing, worktreeName, repoRoot);
++      existing.tasks = addHeartbeatTask(existing, worktreeName, repoRoot, visible);
++    }
++    if (visible) {
++      existing.tasks = addDaemonMonitorTask(existing, worktreeName, repoRoot!);
+     }
+ 
+     if (existing.tasks.length === originalLength) {
+@@ -186,7 +217,10 @@ export async function writeWorktreeTasksFile(
+     tasksJson.tasks = addClaudeTask(tasksJson, worktreeName);
+     tasksJson.tasks = addTmuxTask(tasksJson, worktreeName);
+     if (repoRoot) {
+-      tasksJson.tasks = addHeartbeatTask(tasksJson, worktreeName, repoRoot);
++      tasksJson.tasks = addHeartbeatTask(tasksJson, worktreeName, repoRoot, visible);
++    }
++    if (visible) {
++      tasksJson.tasks = addDaemonMonitorTask(tasksJson, worktreeName, repoRoot!);
+     }
+ 
+     await mkdir(join(worktreePath, ".vscode"), { recursive: true });
+diff --git a/test/heartbeat.test.ts b/test/heartbeat.test.ts
+index e05fb0e..3cd9707 100644
+--- a/test/heartbeat.test.ts
++++ b/test/heartbeat.test.ts
+@@ -66,7 +66,10 @@ describe("sendHeartbeat", () => {
+     sendHeartbeat(testSocketPath, "my-feature");
+ 
+     const msg = await received;
+-    expect(msg).toBe('{"type":"heartbeat","worktree":"my-feature"}\n');
++    const parsed = JSON.parse(msg.trim());
++    expect(parsed.type).toBe("heartbeat");
++    expect(parsed.worktree).toBe("my-feature");
++    expect(typeof parsed.seq).toBe("number");
+   });
+ 
+   it("sends message with correct worktree name", async () => {
+diff --git a/test/ide.test.ts b/test/ide.test.ts
+index b061cbd..f49cc36 100644
+--- a/test/ide.test.ts
++++ b/test/ide.test.ts
+@@ -259,6 +259,54 @@ describe("writeWorktreeTasksFile", () => {
+     const hbTasks = parsed.tasks.filter((t: { label: string }) => t.label === "Heartbeat: my-feature");
+     expect(hbTasks).toHaveLength(1);
+   });
++
++  it("creates 4 tasks when visible=true (Claude + tmux + heartbeat + daemon monitor)", async () => {
++    const status = await writeWorktreeTasksFile(tmpDir, "my-feature", "/fake/repo", true);
++    expect(status).toBe("created");
++
++    const content = await readFile(join(tmpDir, ".vscode", "tasks.json"), "utf-8");
++    const parsed = JSON.parse(content);
++
++    expect(parsed.tasks).toHaveLength(4);
++    expect(parsed.tasks[0].label).toBe("Launch Claude");
++    expect(parsed.tasks[1].label).toBe("tmux: my-feature");
++    expect(parsed.tasks[2].label).toBe("Heartbeat: my-feature");
++    expect(parsed.tasks[3].label).toBe("Daemon Monitor");
++  });
++
++  it("daemon monitor task attaches to the correct tmux session", async () => {
++    await writeWorktreeTasksFile(tmpDir, "my-feature", "/fake/repo", true);
++
++    const content = await readFile(join(tmpDir, ".vscode", "tasks.json"), "utf-8");
++    const parsed = JSON.parse(content);
++    const monitorTask = parsed.tasks.find((t: { label: string }) => t.label === "Daemon Monitor");
++
++    expect(monitorTask).toBeTruthy();
++    expect(monitorTask.command).toBe("tmux attach -t repo_daemon");
++    expect(monitorTask.presentation.reveal).toBe("always");
++    expect(monitorTask.presentation.panel).toBe("dedicated");
++    expect(monitorTask.runOptions.runOn).toBe("folderOpen");
++  });
++
++  it("heartbeat task has reveal=always when visible=true", async () => {
++    await writeWorktreeTasksFile(tmpDir, "my-feature", "/fake/repo", true);
++
++    const content = await readFile(join(tmpDir, ".vscode", "tasks.json"), "utf-8");
++    const parsed = JSON.parse(content);
++    const hbTask = parsed.tasks.find((t: { label: string }) => t.label === "Heartbeat: my-feature");
++
++    expect(hbTask.presentation.reveal).toBe("always");
++  });
++
++  it("does not create daemon monitor when visible=false", async () => {
++    await writeWorktreeTasksFile(tmpDir, "my-feature", "/fake/repo", false);
++
++    const content = await readFile(join(tmpDir, ".vscode", "tasks.json"), "utf-8");
++    const parsed = JSON.parse(content);
++
++    expect(parsed.tasks).toHaveLength(3);
++    expect(parsed.tasks.some((t: { label: string }) => t.label === "Daemon Monitor")).toBe(false);
++  });
+ });
+ 
+ describe("reloadIdeWindow", () => {
+
+mcp startup: no servers
+codex
+Reviewing the changed areas against surrounding code first so the findings are tied to actual control flow and existing patterns. I’m checking the daemon, heartbeat client, IDE task generation, and socket utilities for correctness and failure modes.
+exec
+/bin/zsh -lc "sed -n '1,240p' src/daemon/server.ts" in /Users/matkatmusicllc/Programming/worktree-spawn-util succeeded in 0ms:
+// daemon/server — core daemon logic extracted for testability
+
+import { createServer, type Server, type Socket } from "node:net";
+import { appendFileSync, unlinkSync } from "node:fs";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { EventEmitter } from "node:events";
+
+const execFileAsync = promisify(execFile);
+
+export interface DaemonConfig {
+  heartbeatTimeoutMs: number;
+  checkIntervalMs: number;
+  idleShutdownMs: number;
+  silent: boolean;
+  logFile?: string;
+}
+
+export interface DaemonHandle {
+  server: Server;
+exec
+/bin/zsh -lc "sed -n '1,260p' src/cli/pick-repo.ts" in /Users/matkatmusicllc/Programming/worktree-spawn-utilexec
+/bin/zsh -lc "sed -n '1,240p' src/heartbeat/client.ts" in /Users/matkatmusicllc/Programming/worktree-spawn-utilexec
+/bin/zsh -lc "sed -n '1,280p' src/ide/index.ts" in /Users/matkatmusicllc/Programming/worktree-spawn-util succeeded in 0ms:
+#!/usr/bin/env node
+
+import { execFile, spawn } from "node:child_process";
+import { readFile, appendFile } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import * as readline from "node:readline/promises";
+import { promisify } from "node:util";
+import { validateRepo, createWorktree } from "../git/index.js";
+import { detectIde, launchIde, writeWorktreeTasksFile } from "../ide/index.js";
+import { getSocketPath, ensureSocketDir, isSocketAlive } from "../socket/index.js";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+const execFileAsync = promisify(execFile);
+
+/** Replace characters invalid in git ref names with underscores. */
+function sanitizeWorktreeName(raw: string): string {
+  return raw
+ succeeded in 0ms:
+// heartbeat/client — heartbeat sending logic extracted for testability
+
+import { createConnection } from "node:net";
+import { appendFileSync } from "node:fs";
+
+/** Parse --repo-root and --worktree from CLI args. */
+export function parseArgs(args: string[]): { repoRoot: string; worktree: string } {
+  let repoRoot = "";
+  let worktree = "";
+
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--repo-root" && args[i + 1]) {
+      repoRoot = args[i + 1];
+      i++;
+    } else if (args[i] === "--worktree" && args[i + 1]) {
+      worktree = args[i + 1];
+      i++;
+    }
+  }
+
+ succeeded in 0ms:
+// ide module — configurable IDE launcher (code, agy, cursor, etc.)
+
+import { execFile, spawn } from "node:child_process";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+const execFileAsync = promisify(execFile);
+
+export type IdeConfig = {
+  command: string;
+};
+
+/** Map macOS bundle identifiers to CLI commands. */
+const IDE_BUNDLE_MAP: Record<string, string> = {
+  "com.microsoft.VSCode": "code",
+codex
+I’ve got the main control flow. Next I’m checking the socket helper behavior and the exact line numbers so the review calls out concrete breakpoints instead of generic concerns.
+exec
+/bin/zsh -lc "nl -ba src/ide/index.ts | sed -n '100,240p'" in /Users/matkatmusicllc/Programming/worktree-spawn-utilexec
+/bin/zsh -lc "nl -ba src/daemon/server.ts | sed -n '1,220p'" in /Users/matkatmusicllc/Programming/worktree-spawn-utilexec
+/bin/zsh -lc "nl -ba src/cli/pick-repo.ts | sed -n '1,220p'" in /Users/matkatmusicllc/Programming/worktree-spawn-util succeeded in 0ms:
+   100	    console.log(`[ide] "${tmuxLabel}" task already exists in tasks.json`);
+   101	    return tasks;
+   102	  }
+   103	
+   104	  const tmuxTask: Task = {
+   105	    label: tmuxLabel,
+   106	    type: "shell",
+   107	    command: `tmux new-session -A -s ${worktreeName}`,
+   108	    runOptions: { runOn: "folderOpen" },
+   109	    presentation: { reveal: "always", panel: "dedicated", group: `worktree-${worktreeName}`, focus: false },
+   110	    isBackground: true,
+   111	    problemMatcher: [],
+   112	  };
+   113	
+   114	  tasks.push(tmuxTask);
+   115	  return tasks;
+   116	}
+   117	
+   118	function addHeartbeatTask(existing: TasksJsonFile, worktreeName: string, repoRoot: string, visible?: boolean): Task[] {
+   119	  const tasks = Array.isArray(existing.tasks) ? existing.tasks : [];
+ succeeded in 0ms:
+     1	// daemon/server — core daemon logic extracted for testability
+     2	
+     3	import { createServer, type Server, type Socket } from "node:net";
+     4	import { appendFileSync, unlinkSync } from "node:fs";
+     5	import { execFile } from "node:child_process";
+     6	import { promisify } from "node:util";
+     7	import { EventEmitter } from "node:events";
+     8	
+     9	const execFileAsync = promisify(execFile);
+    10	
+    11	export interface DaemonConfig {
+    12	  heartbeatTimeoutMs: number;
+    13	  checkIntervalMs: number;
+    14	  idleShutdownMs: number;
+    15	  silent: boolean;
+    16	  logFile?: string;
+    17	}
+    18	
+    19	export interface DaemonHandle {
+    20	  server: Server;
+ succeeded in 0ms:
+     1	#!/usr/bin/env node
+     2	
+     3	import { execFile, spawn } from "node:child_process";
+     4	import { readFile, appendFile } from "node:fs/promises";
+     5	import { basename, dirname, join } from "node:path";
+     6	import { fileURLToPath } from "node:url";
+     7	import * as readline from "node:readline/promises";
+     8	import { promisify } from "node:util";
+     9	import { validateRepo, createWorktree } from "../git/index.js";
+    10	import { detectIde, launchIde, writeWorktreeTasksFile } from "../ide/index.js";
+    11	import { getSocketPath, ensureSocketDir, isSocketAlive } from "../socket/index.js";
+    12	
+    13	const __filename = fileURLToPath(import.meta.url);
+    14	const __dirname = dirname(__filename);
+    15	
+    16	const execFileAsync = promisify(execFile);
+    17	
+    18	/** Replace characters invalid in git ref names with underscores. */
+    19	function sanitizeWorktreeName(raw: string): string {
+    20	  return raw
+exec
+/bin/zsh -lc "sed -n '1,260p' src/socket/index.ts" in /Users/matkatmusicllc/Programming/worktree-spawn-utilexec
+/bin/zsh -lc "nl -ba src/heartbeat/client.ts | sed -n '1,220p'" in /Users/matkatmusicllc/Programming/worktree-spawn-util succeeded in 0ms:
+// socket module — Unix domain socket path utilities and liveness checks
+
+import { createHash } from "node:crypto";
+import { mkdirSync, unlinkSync, statSync } from "node:fs";
+import { realpath } from "node:fs/promises";
+import { join } from "node:path";
+import { createConnection } from "node:net";
+
+const SOCKET_DIR_PREFIX = "wtsu";
+
+/** Get the per-user socket directory: /tmp/wtsu-<uid>/ */
+export function getSocketDir(): string {
+  const uid = process.getuid?.() ?? 0;
+  return join("/tmp", `${SOCKET_DIR_PREFIX}-${uid}`);
+}
+
+/** Ensure the socket directory exists with restrictive permissions. */
+export function ensureSocketDir(): string {
+  const dir = getSocketDir();
+  try {
+ succeeded in 0ms:
+     1	// heartbeat/client — heartbeat sending logic extracted for testability
+     2	
+     3	import { createConnection } from "node:net";
+     4	import { appendFileSync } from "node:fs";
+     5	
+     6	/** Parse --repo-root and --worktree from CLI args. */
+     7	export function parseArgs(args: string[]): { repoRoot: string; worktree: string } {
+     8	  let repoRoot = "";
+     9	  let worktree = "";
+    10	
+    11	  for (let i = 0; i < args.length; i++) {
+    12	    if (args[i] === "--repo-root" && args[i + 1]) {
+    13	      repoRoot = args[i + 1];
+    14	      i++;
+    15	    } else if (args[i] === "--worktree" && args[i + 1]) {
+    16	      worktree = args[i + 1];
+    17	      i++;
+    18	    }
+    19	  }
+    20	
+codex
+The socket layer is simple, so the review is converging on three things: session identity, shell-safety of the generated commands, and whether the new logging/visibility path actually preserves the per-repo daemon contract. I’m pulling the CLI wrappers now because two of those issues land there.
+exec
+/bin/zsh -lc "sed -n '1,220p' src/cli/daemon.ts" in /Users/matkatmusicllc/Programming/worktree-spawn-util succeeded in 0ms:
+#!/usr/bin/env node
+
+// daemon CLI — thin wrapper around daemon/server.ts
+
+import { unlinkSync } from "node:fs";
+import { join } from "node:path";
+import { getSocketPath, getSocketDir, ensureSocketDir, cleanStaleSocket } from "../socket/index.js";
+import { createDaemonServer } from "../daemon/server.js";
+
+const args = process.argv.slice(2);
+const silent = args.includes("--silent");
+const repoRoot = args.find((a) => a !== "--silent");
+
+if (!repoRoot) {
+  console.error("[daemon] Usage: daemon [--silent] <repoRoot>");
+  process.exit(1);
+}
+
+const socketPath = await getSocketPath(repoRoot);
+ensureSocketDir();
+exec
+/bin/zsh -lc "nl -ba src/cli/daemon.ts | sed -n '1,220p'" in /Users/matkatmusicllc/Programming/worktree-spawn-utilexec
+/bin/zsh -lc "nl -ba src/cli/heartbeat.ts | sed -n '1,220p'" in /Users/matkatmusicllc/Programming/worktree-spawn-util succeeded in 0ms:
+     1	#!/usr/bin/env node
+     2	
+     3	// daemon CLI — thin wrapper around daemon/server.ts
+     4	
+     5	import { unlinkSync } from "node:fs";
+     6	import { join } from "node:path";
+     7	import { getSocketPath, getSocketDir, ensureSocketDir, cleanStaleSocket } from "../socket/index.js";
+     8	import { createDaemonServer } from "../daemon/server.js";
+     9	
+    10	const args = process.argv.slice(2);
+    11	const silent = args.includes("--silent");
+    12	const repoRoot = args.find((a) => a !== "--silent");
+    13	
+    14	if (!repoRoot) {
+    15	  console.error("[daemon] Usage: daemon [--silent] <repoRoot>");
+    16	  process.exit(1);
+    17	}
+    18	
+    19	const socketPath = await getSocketPath(repoRoot);
+    20	ensureSocketDir();
+ succeeded in 0ms:
+     1	#!/usr/bin/env node
+     2	
+     3	// heartbeat CLI — thin wrapper around heartbeat/client.ts
+     4	
+     5	import { join } from "node:path";
+     6	import { getSocketPath, getSocketDir } from "../socket/index.js";
+     7	import { parseArgs, sendHeartbeat } from "../heartbeat/client.js";
+     8	
+     9	const HEARTBEAT_INTERVAL_MS = 5_000;
+    10	
+    11	const allArgs = process.argv.slice(2);
+    12	const silent = allArgs.includes("--silent");
+    13	const filteredArgs = allArgs.filter((a) => a !== "--silent");
+    14	const { repoRoot, worktree } = parseArgs(filteredArgs);
+    15	
+    16	if (!repoRoot || !worktree) {
+    17	  console.error("[heartbeat] Usage: heartbeat [--silent] --repo-root <path> --worktree <name>");
+    18	  process.exit(1);
+    19	}
+    20	
+exec
+/bin/zsh -lc 'rg -n "tmux|worktree remove|writeWorktreeTasksFile|Heartbeat:" -S src test' in /Users/matkatmusicllc/Programming/worktree-spawn-util succeeded in 0ms:
+test/ide.test.ts:6:import { detectIde, launchIde, writeWorktreeTasksFile, reloadIdeWindow } from "../src/ide/index.js";
+test/ide.test.ts:110:describe("writeWorktreeTasksFile", () => {
+test/ide.test.ts:121:  it("returns 'created' with both Claude and tmux tasks", async () => {
+test/ide.test.ts:122:    const status = await writeWorktreeTasksFile(tmpDir, "my-feature");
+test/ide.test.ts:136:    expect(parsed.tasks[1].label).toBe("tmux: my-feature");
+test/ide.test.ts:137:    expect(parsed.tasks[1].command).toBe("tmux new-session -A -s my-feature");
+test/ide.test.ts:141:    await writeWorktreeTasksFile(tmpDir, "my-feature");
+test/ide.test.ts:164:    const status = await writeWorktreeTasksFile(tmpDir, "my-feature");
+test/ide.test.ts:176:    expect(parsed.tasks[2].label).toBe("tmux: my-feature");
+test/ide.test.ts:184:        { label: "tmux: my-feature", type: "shell", command: "tmux new-session -A -s my-feature" },
+test/ide.test.ts:194:    const status = await writeWorktreeTasksFile(tmpDir, "my-feature");
+test/ide.test.ts:204:  it("creates 3 tasks when repoRoot is provided (Claude + tmux + heartbeat)", async () => {
+test/ide.test.ts:205:    const status = await writeWorktreeTasksFile(tmpDir, "my-feature", "/fake/repo");
+test/ide.test.ts:213:    expect(parsed.tasks[1].label).toBe("tmux: my-feature");
+test/ide.test.ts:214:    expect(parsed.tasks[2].label).toBe("Heartbeat: my-feature");
+test/ide.test.ts:218:    await writeWorktreeTasksFile(tmpDir, "my-feature", "/fake/repo");
+test/ide.test.ts:222:    const hbTask = parsed.tasks.find((t: { label: string }) => t.label === "Heartbeat: my-feature");
+test/ide.test.ts:231:    await writeWorktreeTasksFile(tmpDir, "my-feature", "/fake/repo");
+test/ide.test.ts:235:    const hbTask = parsed.tasks.find((t: { label: string }) => t.label === "Heartbeat: my-feature");
+test/ide.test.ts:243:    await writeWorktreeTasksFile(tmpDir, "my-feature");
+codex
+One more pass: I’m checking whether the new `--visible` plumbing actually updates existing task definitions or just appends new ones. That matters here because worktrees inherit the repo’s checked-in `.vscode/tasks.json`, so this code almost always runs in the “merge into existing file” path.
+exec
+/bin/zsh -lc 'cat tsconfig.json' in /Users/matkatmusicllc/Programming/worktree-spawn-util succeeded in 0ms:
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "incremental": true,
+    "outDir": "dist",
+    "rootDir": "src",
+    "declaration": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": ["src"],
+  "exclude": ["node_modules", "dist"]
+}
+exec
+/bin/zsh -lc "sed -n '1,140p' .vscode/tasks.json" in /Users/matkatmusicllc/Programming/worktree-spawn-util succeeded in 0ms:
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Worktree: Pick Repository",
+      "type": "shell",
+      "command": "node",
+      "args": ["${workspaceFolder}/dist/cli/pick-repo.js", "--visible", "${input:worktreeName}"],
+      "presentation": {
+        "reveal": "always",
+        "panel": "new",
+        "focus": true
+      },
+      "problemMatcher": [],
+      "dependsOn": ["Build"]
+    },
+    {
+      "label": "Build",
+      "type": "shell",
+      "command": "npm",
+exec
+/bin/zsh -lc "sed -n '1,220p' test/ide.test.ts" in /Users/matkatmusicllc/Programming/worktree-spawn-util succeeded in 0ms:
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { mkdtemp, rm, readFile, mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { spawn, execFile } from "node:child_process";
+import { detectIde, launchIde, writeWorktreeTasksFile, reloadIdeWindow } from "../src/ide/index.js";
+
+vi.mock("node:child_process", () => ({
+  spawn: vi.fn(() => ({ unref: vi.fn() })),
+  execFile: vi.fn((_cmd: string, _args: string[], cb: Function) => cb(null, "", "")),
+}));
+
+const mockSpawn = vi.mocked(spawn);
+
+describe("detectIde", () => {
+  const originalEnv = { ...process.env };
+
+  beforeEach(() => {
+    delete process.env.__CFBundleIdentifier;
+    delete process.env.VSCODE_GIT_ASKPASS_NODE;
+exec
+/bin/zsh -lc 'rg -n "noUnusedLocals|noUnusedParameters|strict" tsconfig*.json package.json' in /Users/matkatmusicllc/Programming/worktree-spawn-util succeeded in 0ms:
+tsconfig.json:6:    "strict": true,
+codex
+The compile path looks permissive, so the review is about runtime behavior rather than lint breakage. I’m doing a quick check on `RunMeFirst.sh` only to see if there’s an obvious regression there; the main issues are already in the daemon/task flow.
+exec
+/bin/zsh -lc "nl -ba RunMeFirst.sh | sed -n '1,220p'" in /Users/matkatmusicllc/Programming/worktree-spawn-utilexec
+/bin/zsh -lc "sed -n '1,220p' src/cli/daemon.ts" in /Users/matkatmusicllc/Programming/worktree-spawn-utilexec
+/bin/zsh -lc "sed -n '1,220p' RunMeFirst.sh" in /Users/matkatmusicllc/Programming/worktree-spawn-util succeeded in 0ms:
+#!/usr/bin/env node
+
+// daemon CLI — thin wrapper around daemon/server.ts
+
+import { unlinkSync } from "node:fs";
+import { join } from "node:path";
+import { getSocketPath, getSocketDir, ensureSocketDir, cleanStaleSocket } from "../socket/index.js";
+import { createDaemonServer } from "../daemon/server.js";
+
+const args = process.argv.slice(2);
+const silent = args.includes("--silent");
+const repoRoot = args.find((a) => a !== "--silent");
+
+if (!repoRoot) {
+  console.error("[daemon] Usage: daemon [--silent] <repoRoot>");
+  process.exit(1);
+}
+
+const socketPath = await getSocketPath(repoRoot);
+ensureSocketDir();
+ succeeded in 0ms:
+     1	#!/usr/bin/env bash
+     2	set -e
+     3	
+     4	echo "=== Worktree Spawn Util — First-Time Setup ==="
+     5	echo ""
+     6	
+     7	# 1. Check for Node.js
+     8	if command -v node &>/dev/null; then
+     9	    echo "Node.js found: $(node --version)"
+    10	else
+    11	    echo "Node.js is not installed."
+    12	
+    13	    # Check for Homebrew
+    14	    if ! command -v brew &>/dev/null; then
+    15	        read -rp "Homebrew is not installed. Install it now? (y/n) " install_brew
+    16	        if [[ "$install_brew" =~ ^[Yy]$ ]]; then
+    17	            echo "Installing Homebrew..."
+    18	            /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+    19	        else
+    20	            echo "Please install Node.js manually: https://nodejs.org"
+ succeeded in 0ms:
+#!/usr/bin/env bash
+set -e
+
+echo "=== Worktree Spawn Util — First-Time Setup ==="
+echo ""
+
+# 1. Check for Node.js
+if command -v node &>/dev/null; then
+    echo "Node.js found: $(node --version)"
+else
+    echo "Node.js is not installed."
+
+    # Check for Homebrew
+    if ! command -v brew &>/dev/null; then
+        read -rp "Homebrew is not installed. Install it now? (y/n) " install_brew
+        if [[ "$install_brew" =~ ^[Yy]$ ]]; then
+            echo "Installing Homebrew..."
+            /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+        else
+            echo "Please install Node.js manually: https://nodejs.org"
+codex
+1. High — [src/cli/pick-repo.ts:102](/Users/matkatmusicllc/Programming/worktree-spawn-util/src/cli/pick-repo.ts#L102), [src/cli/pick-repo.ts:107](/Users/matkatmusicllc/Programming/worktree-spawn-util/src/cli/pick-repo.ts#L107), [src/ide/index.ts:156](/Users/matkatmusicllc/Programming/worktree-spawn-util/src/ide/index.ts#L156)  
+What: the daemon tmux session is keyed by `basename(repoRoot)` and then reused in a shell command. That makes the identifier neither unique nor shell-safe. Two different repos named `api` will target the same `api_daemon` session, and basenames with spaces or shell metacharacters will break `tmux attach` or be interpreted by the shell.  
+Why: the second repo can silently fall back to a detached daemon while the monitor task attaches to the first repo’s daemon, so visibility and cleanup diagnostics are wrong. In the worst case, odd repo names can execute unintended shell fragments.  
+Fix: add a shared `getDaemonSessionName(repoRoot)` helper derived from a stable unique value such as the same hashed realpath used for the socket, and use that helper everywhere. When emitting VS Code shell commands, quote/escape the session name instead of interpolating raw text.
+
+2. Medium — [src/cli/pick-repo.ts:119](/Users/matkatmusicllc/Programming/worktree-spawn-util/src/cli/pick-repo.ts#L119)  
+What: the new readiness poll has no failure path. If the socket never comes up within 5 seconds, the code still writes tasks and opens the IDE as if the daemon were healthy.  
+Why: daemon startup failures become silent. The heartbeat task will just warn and retry forever, while the user assumes automatic cleanup is active when it is not.  
+Fix: after the poll loop, explicitly fail if the socket is still dead. At minimum, print a hard error and exit non-zero; better, capture tmux startup stderr or retry the non-tmux fallback before proceeding.
+
+3. Medium — [src/ide/index.ts:121](/Users/matkatmusicllc/Programming/worktree-spawn-util/src/ide/index.ts#L121), [src/ide/index.ts:126](/Users/matkatmusicllc/Programming/worktree-spawn-util/src/ide/index.ts#L126), [src/ide/index.ts:194](/Users/matkatmusicllc/Programming/worktree-spawn-util/src/ide/index.ts#L194)  
+What: `--visible` is implemented as append-only. If a `Heartbeat: <worktree>` task already exists, `addHeartbeatTask` returns early and never reconciles `reveal`, `panel`, or `group`.  
+Why: rerunning generation with a different visibility mode is not idempotent. You can end up with a visible monitor task plus an old hidden heartbeat task, which is inconsistent with the requested mode.  
+Fix: when a task with the same label already exists, update the relevant fields in place instead of returning immediately. Tests should cover toggling `visible` on an existing `tasks.json`.
+
+4. Low — [src/cli/daemon.ts:30](/Users/matkatmusicllc/Programming/worktree-spawn-util/src/cli/daemon.ts#L30), [src/cli/heartbeat.ts:23](/Users/matkatmusicllc/Programming/worktree-spawn-util/src/cli/heartbeat.ts#L23)  
+What: all repos append diagnostics to the same per-user file, `.../wtsu-<uid>/daemon.log`.  
+Why: this loses the per-repo boundary the socket design established. Logs from unrelated repos and daemons will interleave, which makes debugging race conditions or cleanup failures much harder.  
+Fix: derive the log filename from the same repo hash as the socket, for example `${socketPath}.log` or `<hash>.log`.
+
+5. Low — [src/ide/index.ts:201](/Users/matkatmusicllc/Programming/worktree-spawn-util/src/ide/index.ts#L201), [src/ide/index.ts:222](/Users/matkatmusicllc/Programming/worktree-spawn-util/src/ide/index.ts#L222)  
+What: `writeWorktreeTasksFile()` still types `repoRoot` as optional, but `visible` mode now dereferences `repoRoot!`.  
+Why: the exported API now has an invalid state that will throw at runtime instead of failing clearly. That is easy to miss in future callers because the type signature still says the argument is optional.  
+Fix: encode the dependency in the API. Either make `repoRoot` required whenever `visible` is supported, or guard with an explicit error before calling `basename(repoRoot)`.
+
+Residual gap: I did not find coverage for repo basenames with spaces/metacharacters, duplicate repo basenames, or the socket-readiness timeout path. Those are the cases most likely to regress this feature.
+tokens used
+36,952
+1. High — [src/cli/pick-repo.ts:102](/Users/matkatmusicllc/Programming/worktree-spawn-util/src/cli/pick-repo.ts#L102), [src/cli/pick-repo.ts:107](/Users/matkatmusicllc/Programming/worktree-spawn-util/src/cli/pick-repo.ts#L107), [src/ide/index.ts:156](/Users/matkatmusicllc/Programming/worktree-spawn-util/src/ide/index.ts#L156)  
+What: the daemon tmux session is keyed by `basename(repoRoot)` and then reused in a shell command. That makes the identifier neither unique nor shell-safe. Two different repos named `api` will target the same `api_daemon` session, and basenames with spaces or shell metacharacters will break `tmux attach` or be interpreted by the shell.  
+Why: the second repo can silently fall back to a detached daemon while the monitor task attaches to the first repo’s daemon, so visibility and cleanup diagnostics are wrong. In the worst case, odd repo names can execute unintended shell fragments.  
+Fix: add a shared `getDaemonSessionName(repoRoot)` helper derived from a stable unique value such as the same hashed realpath used for the socket, and use that helper everywhere. When emitting VS Code shell commands, quote/escape the session name instead of interpolating raw text.
+
+2. Medium — [src/cli/pick-repo.ts:119](/Users/matkatmusicllc/Programming/worktree-spawn-util/src/cli/pick-repo.ts#L119)  
+What: the new readiness poll has no failure path. If the socket never comes up within 5 seconds, the code still writes tasks and opens the IDE as if the daemon were healthy.  
+Why: daemon startup failures become silent. The heartbeat task will just warn and retry forever, while the user assumes automatic cleanup is active when it is not.  
+Fix: after the poll loop, explicitly fail if the socket is still dead. At minimum, print a hard error and exit non-zero; better, capture tmux startup stderr or retry the non-tmux fallback before proceeding.
+
+3. Medium — [src/ide/index.ts:121](/Users/matkatmusicllc/Programming/worktree-spawn-util/src/ide/index.ts#L121), [src/ide/index.ts:126](/Users/matkatmusicllc/Programming/worktree-spawn-util/src/ide/index.ts#L126), [src/ide/index.ts:194](/Users/matkatmusicllc/Programming/worktree-spawn-util/src/ide/index.ts#L194)  
+What: `--visible` is implemented as append-only. If a `Heartbeat: <worktree>` task already exists, `addHeartbeatTask` returns early and never reconciles `reveal`, `panel`, or `group`.  
+Why: rerunning generation with a different visibility mode is not idempotent. You can end up with a visible monitor task plus an old hidden heartbeat task, which is inconsistent with the requested mode.  
+Fix: when a task with the same label already exists, update the relevant fields in place instead of returning immediately. Tests should cover toggling `visible` on an existing `tasks.json`.
+
+4. Low — [src/cli/daemon.ts:30](/Users/matkatmusicllc/Programming/worktree-spawn-util/src/cli/daemon.ts#L30), [src/cli/heartbeat.ts:23](/Users/matkatmusicllc/Programming/worktree-spawn-util/src/cli/heartbeat.ts#L23)  
+What: all repos append diagnostics to the same per-user file, `.../wtsu-<uid>/daemon.log`.  
+Why: this loses the per-repo boundary the socket design established. Logs from unrelated repos and daemons will interleave, which makes debugging race conditions or cleanup failures much harder.  
+Fix: derive the log filename from the same repo hash as the socket, for example `${socketPath}.log` or `<hash>.log`.
+
+5. Low — [src/ide/index.ts:201](/Users/matkatmusicllc/Programming/worktree-spawn-util/src/ide/index.ts#L201), [src/ide/index.ts:222](/Users/matkatmusicllc/Programming/worktree-spawn-util/src/ide/index.ts#L222)  
+What: `writeWorktreeTasksFile()` still types `repoRoot` as optional, but `visible` mode now dereferences `repoRoot!`.  
+Why: the exported API now has an invalid state that will throw at runtime instead of failing clearly. That is easy to miss in future callers because the type signature still says the argument is optional.  
+Fix: encode the dependency in the API. Either make `repoRoot` required whenever `visible` is supported, or guard with an explicit error before calling `basename(repoRoot)`.
+
+Residual gap: I did not find coverage for repo basenames with spaces/metacharacters, duplicate repo basenames, or the socket-readiness timeout path. Those are the cases most likely to regress this feature.
+Waiting for the debugger to disconnect...

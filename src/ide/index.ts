@@ -3,6 +3,7 @@
 import { execFile, spawn } from "node:child_process";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { getDaemonSessionName } from "../socket/index.js";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
@@ -72,50 +73,29 @@ interface TasksJsonFile {
   tasks: Task[];
 }
 
-function addClaudeTask(existing: TasksJsonFile, worktreeName: string): Task[] {
+function addWorktreeSessionTask(existing: TasksJsonFile, worktreeName: string): Task[] {
   const tasks = Array.isArray(existing.tasks) ? existing.tasks : [];
-  if (tasks.some((t) => t.label === "Launch Claude")) {
-    console.log(`[ide] "Launch Claude" task already exists in tasks.json`);
+  const label = `Worktree: ${worktreeName}`;
+  if (tasks.some((t) => t.label === label)) {
+    console.log(`[ide] "${label}" task already exists in tasks.json`);
     return tasks;
   }
 
-  const claudeTask: Task = {
-    label: "Launch Claude",
+  const task: Task = {
+    label,
     type: "shell",
-    command: "claude --permission-mode plan",
+    command: `tmux attach -t ${worktreeName}`,
     runOptions: { runOn: "folderOpen" },
     presentation: { reveal: "always", panel: "dedicated", group: `worktree-${worktreeName}`, focus: true },
     isBackground: true,
     problemMatcher: [],
   };
 
-  tasks.push(claudeTask);
+  tasks.push(task);
   return tasks;
 }
 
-function addTmuxTask(existing: TasksJsonFile, worktreeName: string): Task[] {
-  const tasks = Array.isArray(existing.tasks) ? existing.tasks : [];
-  const tmuxLabel = `tmux: ${worktreeName}`;
-  if (tasks.some((t) => t.label === tmuxLabel)) {
-    console.log(`[ide] "${tmuxLabel}" task already exists in tasks.json`);
-    return tasks;
-  }
-
-  const tmuxTask: Task = {
-    label: tmuxLabel,
-    type: "shell",
-    command: `tmux new-session -A -s ${worktreeName}`,
-    runOptions: { runOn: "folderOpen" },
-    presentation: { reveal: "always", panel: "dedicated", group: `worktree-${worktreeName}`, focus: false },
-    isBackground: true,
-    problemMatcher: [],
-  };
-
-  tasks.push(tmuxTask);
-  return tasks;
-}
-
-function addHeartbeatTask(existing: TasksJsonFile, worktreeName: string, repoRoot: string): Task[] {
+function addHeartbeatTask(existing: TasksJsonFile, worktreeName: string, repoRoot: string, visible?: boolean): Task[] {
   const tasks = Array.isArray(existing.tasks) ? existing.tasks : [];
   const heartbeatLabel = `Heartbeat: ${worktreeName}`;
   if (tasks.some((t) => t.label === heartbeatLabel)) {
@@ -126,14 +106,41 @@ function addHeartbeatTask(existing: TasksJsonFile, worktreeName: string, repoRoo
   const heartbeatTask: Task = {
     label: heartbeatLabel,
     type: "shell",
-    command: `node "${join(__dirname, "..", "cli", "heartbeat.js")}" --repo-root "${repoRoot}" --worktree ${worktreeName}`,
+    command: `node "${join(__dirname, "..", "cli", "heartbeat.js")}" --repo-root "${repoRoot}" --worktree "${worktreeName}"`,
     runOptions: { runOn: "folderOpen" },
-    presentation: { reveal: "never", panel: "shared", group: `worktree-${worktreeName}`, focus: false },
+    presentation: {
+      reveal: visible ? "always" : "never",
+      panel: visible ? "dedicated" : "shared",
+      group: visible ? `daemon-${worktreeName}` : `heartbeat-${worktreeName}`,
+      focus: false,
+    },
     isBackground: true,
     problemMatcher: [],
   };
 
   tasks.push(heartbeatTask);
+  return tasks;
+}
+
+function addDaemonMonitorTask(existing: TasksJsonFile, worktreeName: string, sessionName: string): Task[] {
+  const tasks = Array.isArray(existing.tasks) ? existing.tasks : [];
+  const label = "Daemon Monitor";
+  if (tasks.some((t) => t.label === label)) {
+    console.log(`[ide] "${label}" task already exists in tasks.json`);
+    return tasks;
+  }
+
+  const monitorTask: Task = {
+    label,
+    type: "shell",
+    command: `tmux attach -t ${sessionName}`,
+    runOptions: { runOn: "folderOpen" },
+    presentation: { reveal: "always", panel: "dedicated", group: `daemon-${worktreeName}`, focus: false },
+    isBackground: true,
+    problemMatcher: [],
+  };
+
+  tasks.push(monitorTask);
   return tasks;
 }
 
@@ -150,8 +157,10 @@ export async function writeWorktreeTasksFile(
   worktreePath: string,
   worktreeName: string,
   repoRoot?: string,
+  visible?: boolean,
 ): Promise<TasksFileStatus> {
   const tasksPath = join(worktreePath, ".vscode", "tasks.json");
+  const sessionName = (visible && repoRoot) ? await getDaemonSessionName(repoRoot) : undefined;
 
   // Try to read existing tasks.json
   let existing: TasksJsonFile | null = null;
@@ -165,10 +174,12 @@ export async function writeWorktreeTasksFile(
 
   if (existing) {
     const originalLength = Array.isArray(existing.tasks) ? existing.tasks.length : 0;
-    existing.tasks = addClaudeTask(existing, worktreeName);
-    existing.tasks = addTmuxTask(existing, worktreeName);
     if (repoRoot) {
-      existing.tasks = addHeartbeatTask(existing, worktreeName, repoRoot);
+      existing.tasks = addHeartbeatTask(existing, worktreeName, repoRoot, visible);
+    }
+    existing.tasks = addWorktreeSessionTask(existing, worktreeName);
+    if (visible && sessionName) {
+      existing.tasks = addDaemonMonitorTask(existing, worktreeName, sessionName);
     }
 
     if (existing.tasks.length === originalLength) {
@@ -183,10 +194,12 @@ export async function writeWorktreeTasksFile(
       tasks: [],
     };
 
-    tasksJson.tasks = addClaudeTask(tasksJson, worktreeName);
-    tasksJson.tasks = addTmuxTask(tasksJson, worktreeName);
     if (repoRoot) {
-      tasksJson.tasks = addHeartbeatTask(tasksJson, worktreeName, repoRoot);
+      tasksJson.tasks = addHeartbeatTask(tasksJson, worktreeName, repoRoot, visible);
+    }
+    tasksJson.tasks = addWorktreeSessionTask(tasksJson, worktreeName);
+    if (visible && sessionName) {
+      tasksJson.tasks = addDaemonMonitorTask(tasksJson, worktreeName, sessionName);
     }
 
     await mkdir(join(worktreePath, ".vscode"), { recursive: true });

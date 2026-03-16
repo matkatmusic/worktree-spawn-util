@@ -118,7 +118,7 @@ describe("writeWorktreeTasksFile", () => {
     await rm(tmpDir, { recursive: true, force: true });
   });
 
-  it("returns 'created' with both Claude and tmux tasks", async () => {
+  it("returns 'created' with worktree session task", async () => {
     const status = await writeWorktreeTasksFile(tmpDir, "my-feature");
     expect(status).toBe("created");
 
@@ -129,89 +129,21 @@ describe("writeWorktreeTasksFile", () => {
     const parsed = JSON.parse(content);
 
     expect(parsed.version).toBe("2.0.0");
-    expect(parsed.tasks).toHaveLength(2);
-    expect(parsed.tasks[0].label).toBe("Launch Claude");
-    expect(parsed.tasks[0].runOptions.runOn).toBe("folderOpen");
-    expect(parsed.tasks[0].isBackground).toBe(true);
-    expect(parsed.tasks[1].label).toBe("tmux: my-feature");
-    expect(parsed.tasks[1].command).toBe("tmux new-session -A -s my-feature");
+    expect(parsed.tasks).toHaveLength(1);
+    expect(parsed.tasks[0].label).toBe("Worktree: my-feature");
+    expect(parsed.tasks[0].command).toBe("tmux attach -t my-feature");
   });
 
-  it("interpolates worktree name into group fields", async () => {
-    await writeWorktreeTasksFile(tmpDir, "my-feature");
-
-    const content = await readFile(
-      join(tmpDir, ".vscode", "tasks.json"),
-      "utf-8",
-    );
-    const parsed = JSON.parse(content);
-
-    expect(parsed.tasks[0].presentation.group).toBe("worktree-my-feature");
-    expect(parsed.tasks[1].presentation.group).toBe("worktree-my-feature");
-  });
-
-  it("returns 'updated' and preserves existing tasks", async () => {
-    const existing = {
-      version: "2.0.0",
-      tasks: [{ label: "Build", type: "shell", command: "npm run build" }],
-    };
-    await mkdir(join(tmpDir, ".vscode"), { recursive: true });
-    await writeFile(
-      join(tmpDir, ".vscode", "tasks.json"),
-      JSON.stringify(existing),
-    );
-
-    const status = await writeWorktreeTasksFile(tmpDir, "my-feature");
-    expect(status).toBe("updated");
-
-    const content = await readFile(
-      join(tmpDir, ".vscode", "tasks.json"),
-      "utf-8",
-    );
-    const parsed = JSON.parse(content);
-
-    expect(parsed.tasks).toHaveLength(3);
-    expect(parsed.tasks[0].label).toBe("Build");
-    expect(parsed.tasks[1].label).toBe("Launch Claude");
-    expect(parsed.tasks[2].label).toBe("tmux: my-feature");
-  });
-
-  it("returns 'unchanged' if both tasks already exist", async () => {
-    const existing = {
-      version: "2.0.0",
-      tasks: [
-        { label: "Launch Claude", type: "shell", command: "claude" },
-        { label: "tmux: my-feature", type: "shell", command: "tmux new-session -A -s my-feature" },
-      ],
-    };
-    await mkdir(join(tmpDir, ".vscode"), { recursive: true });
-    const originalContent = JSON.stringify(existing);
-    await writeFile(
-      join(tmpDir, ".vscode", "tasks.json"),
-      originalContent,
-    );
-
-    const status = await writeWorktreeTasksFile(tmpDir, "my-feature");
-    expect(status).toBe("unchanged");
-
-    const content = await readFile(
-      join(tmpDir, ".vscode", "tasks.json"),
-      "utf-8",
-    );
-    expect(content).toBe(originalContent);
-  });
-
-  it("creates 3 tasks when repoRoot is provided (Claude + tmux + heartbeat)", async () => {
+  it("creates 2 tasks when repoRoot is provided (heartbeat + worktree session)", async () => {
     const status = await writeWorktreeTasksFile(tmpDir, "my-feature", "/fake/repo");
     expect(status).toBe("created");
 
     const content = await readFile(join(tmpDir, ".vscode", "tasks.json"), "utf-8");
     const parsed = JSON.parse(content);
 
-    expect(parsed.tasks).toHaveLength(3);
-    expect(parsed.tasks[0].label).toBe("Launch Claude");
-    expect(parsed.tasks[1].label).toBe("tmux: my-feature");
-    expect(parsed.tasks[2].label).toBe("Heartbeat: my-feature");
+    expect(parsed.tasks).toHaveLength(2);
+    expect(parsed.tasks[0].label).toBe("Heartbeat: my-feature");
+    expect(parsed.tasks[1].label).toBe("Worktree: my-feature");
   });
 
   it("heartbeat task contains correct repo-root and worktree args", async () => {
@@ -223,7 +155,7 @@ describe("writeWorktreeTasksFile", () => {
 
     expect(hbTask).toBeTruthy();
     expect(hbTask.command).toContain('--repo-root "/fake/repo"');
-    expect(hbTask.command).toContain("--worktree my-feature");
+    expect(hbTask.command).toContain('--worktree "my-feature"');
     expect(hbTask.command).toContain("heartbeat.js");
   });
 
@@ -245,7 +177,7 @@ describe("writeWorktreeTasksFile", () => {
     const content = await readFile(join(tmpDir, ".vscode", "tasks.json"), "utf-8");
     const parsed = JSON.parse(content);
 
-    expect(parsed.tasks).toHaveLength(2);
+    expect(parsed.tasks).toHaveLength(1);
     expect(parsed.tasks.some((t: { label: string }) => t.label.startsWith("Heartbeat:"))).toBe(false);
   });
 
@@ -258,6 +190,53 @@ describe("writeWorktreeTasksFile", () => {
     const parsed = JSON.parse(content);
     const hbTasks = parsed.tasks.filter((t: { label: string }) => t.label === "Heartbeat: my-feature");
     expect(hbTasks).toHaveLength(1);
+  });
+
+  it("creates 3 tasks when visible=true (worktree session + heartbeat + daemon monitor)", async () => {
+    const status = await writeWorktreeTasksFile(tmpDir, "my-feature", tmpDir, true);
+    expect(status).toBe("created");
+
+    const content = await readFile(join(tmpDir, ".vscode", "tasks.json"), "utf-8");
+    const parsed = JSON.parse(content);
+
+    expect(parsed.tasks).toHaveLength(3);
+    expect(parsed.tasks[0].label).toBe("Heartbeat: my-feature");
+    expect(parsed.tasks[1].label).toBe("Worktree: my-feature");
+    expect(parsed.tasks[2].label).toBe("Daemon Monitor");
+  });
+
+  it("daemon monitor task attaches to the correct tmux session", async () => {
+    await writeWorktreeTasksFile(tmpDir, "my-feature", tmpDir, true);
+
+    const content = await readFile(join(tmpDir, ".vscode", "tasks.json"), "utf-8");
+    const parsed = JSON.parse(content);
+    const monitorTask = parsed.tasks.find((t: { label: string }) => t.label === "Daemon Monitor");
+
+    expect(monitorTask).toBeTruthy();
+    expect(monitorTask.command).toMatch(/^tmux attach -t wtsu_daemon_[0-9a-f]{12}$/);
+    expect(monitorTask.presentation.reveal).toBe("always");
+    expect(monitorTask.presentation.panel).toBe("dedicated");
+    expect(monitorTask.runOptions.runOn).toBe("folderOpen");
+  });
+
+  it("heartbeat task has reveal=always when visible=true", async () => {
+    await writeWorktreeTasksFile(tmpDir, "my-feature", tmpDir, true);
+
+    const content = await readFile(join(tmpDir, ".vscode", "tasks.json"), "utf-8");
+    const parsed = JSON.parse(content);
+    const hbTask = parsed.tasks.find((t: { label: string }) => t.label === "Heartbeat: my-feature");
+
+    expect(hbTask.presentation.reveal).toBe("always");
+  });
+
+  it("does not create daemon monitor when visible=false", async () => {
+    await writeWorktreeTasksFile(tmpDir, "my-feature", "/fake/repo", false);
+
+    const content = await readFile(join(tmpDir, ".vscode", "tasks.json"), "utf-8");
+    const parsed = JSON.parse(content);
+
+    expect(parsed.tasks).toHaveLength(2);
+    expect(parsed.tasks.some((t: { label: string }) => t.label === "Daemon Monitor")).toBe(false);
   });
 });
 

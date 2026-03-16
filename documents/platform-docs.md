@@ -282,3 +282,23 @@ src/index.ts            <-- barrel export surface
 The data flow for a single session is strictly linear: the git module produces a `WorktreeInfo`, the ide module consumes it and produces a `ProcessHandle`, and the process module consumes the handle to watch for exit. Configuration flows in from `SpawnConfig` orthogonally to all modules. The daemon provides an optional supervisory layer over multiple concurrent sessions.
 
 All modules are currently at the type-definition and stub stage. The `simple-git` dependency is the only runtime library, signaling that full git worktree operations are the next implementation milestone.
+
+---
+
+## Known Issues
+
+### Antigravity (AGY) fires `folderOpen` tasks twice
+
+**Status:** Known, not affecting functionality.
+
+**Symptom:** When Antigravity opens a worktree folder, tasks with `runOn: "folderOpen"` are executed twice, approximately 5 seconds apart. The daemon log shows duplicate heartbeat `#1` and `#2` entries before normalizing to a single stream.
+
+**Impact:** None. The first heartbeat process is killed when the second starts. The daemon tracks heartbeats by worktree name (not process identity), so the replacement is seamless. Cleanup triggers correctly when the IDE window is closed.
+
+**Investigated causes (all ruled out):**
+- `reloadIdeWindow()` — removed, double-fire persists
+- VS Code task sequencing (`dependsOrder`) — reverted, double-fire persists
+- Node.js debug auto-attach (`ms-vscode.js-debug` "always" mode) — disabled, double-fire persists
+- Multiple `folderOpen` tasks interacting — reduced to single task, double-fire persists
+
+**Conclusion:** This appears to be an Antigravity-specific behavior during window initialization. Not reproducible in standard VS Code.
