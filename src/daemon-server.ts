@@ -1,11 +1,14 @@
 // daemon/server — core daemon logic extracted for testability
 
 import { createServer, type Server, type Socket } from "node:net";
-import { appendFileSync, unlinkSync } from "node:fs";
-import { appendFile } from "node:fs/promises";
+import { unlinkSync } from "node:fs";
 import { execFile } from "node:child_process";
+import { join } from "node:path";
 import { promisify } from "node:util";
 import { EventEmitter } from "node:events";
+import { isBranchMerged, hasNewCommits, onlyIgnorableChanges, removeWorktreeAndBranch } from "./git.js";
+import { notifyUser } from "./ide.js";
+import type { Logger } from "./logger.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -13,13 +16,18 @@ export interface DaemonConfig {
   heartbeatTimeoutMs: number;
   checkIntervalMs: number;
   idleShutdownMs: number;
-  silent: boolean;
-  logFile?: string;
+  logger?: Logger;
+}
+
+export interface WorktreeState {
+  lastHeartbeat: number;
+  parentBranch: string;
+  parentCommit: string;
 }
 
 export interface DaemonHandle {
   server: Server;
-  heartbeats: Map<string, number>;
+  heartbeats: Map<string, WorktreeState>;
   events: EventEmitter;
   shutdown: () => void;
 }
@@ -28,7 +36,6 @@ const DEFAULT_CONFIG: DaemonConfig = {
   heartbeatTimeoutMs: 15_000,
   checkIntervalMs: 5_000,
   idleShutdownMs: 60_000,
-  silent: false,
 };
 
 /**
@@ -45,51 +52,74 @@ export function createDaemonServer(
   config: Partial<DaemonConfig> = {},
 ): DaemonHandle {
   const cfg: DaemonConfig = { ...DEFAULT_CONFIG, ...config };
-  const heartbeats = new Map<string, number>();
+  const logger = cfg.logger;
+  const heartbeats = new Map<string, WorktreeState>();
   const events = new EventEmitter();
   let lastActivityTime = Date.now();
 
-  function logToFile(message: string): void {
-    if (!cfg.logFile) return;
-    appendFile(cfg.logFile, `[${new Date().toISOString()}] ${message}\n`).catch(() => {});
-  }
+  // Session header is written by the CLI caller (cli/daemon.ts) before creating the server
 
-  // Write session header
-  if (cfg.logFile) {
-    try {
-      appendFileSync(cfg.logFile,
-        `\n=== SESSION START ===\n` +
-        `worktree: (pending first heartbeat)\n` +
-        `launched: ${new Date().toISOString()}\n` +
-        `repo: ${repoRoot}\n` +
-        `socket: ${socketPath}\n` +
-        `========================\n`,
-      );
-    } catch {
-      // Best effort
-    }
-  }
-
-  async function cleanupWorktree(worktreeName: string): Promise<void> {
-    console.log(`[daemon] No heartbeat for "${worktreeName}" — triggering cleanup`);
-    logToFile(`[daemon] No heartbeat for "${worktreeName}" — triggering cleanup`);
+  async function cleanupWorktree(worktreeName: string, state: WorktreeState): Promise<void> {
+    logger?.log(`[daemon] No heartbeat for "${worktreeName}" — evaluating cleanup`);
     events.emit("cleanup", worktreeName);
 
-    // Kill tmux session
+    // Always kill tmux session
     try {
       await execFileAsync("tmux", ["kill-session", "-t", worktreeName]);
-      console.log(`[daemon] Killed tmux session: ${worktreeName}`);
+      logger?.log(`[daemon] Killed tmux session: ${worktreeName}`);
     } catch {
       // Session may not exist
     }
 
-    // Delete worktree via git
+    const worktreePath = join(repoRoot, ".worktrees", worktreeName);
+
+    if (!state.parentBranch || !state.parentCommit) {
+      // No parent info — force delete (legacy behavior)
+      logger?.log(`[daemon] No parent info for "${worktreeName}" — force deleting`);
+      try {
+        await removeWorktreeAndBranch(repoRoot, worktreeName, logger);
+        logger?.log(`[daemon] Removed worktree and branch: ${worktreeName}`);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger?.error(`[daemon] Failed to remove worktree "${worktreeName}": ${msg}`);
+      }
+      return;
+    }
+
     try {
-      await execFileAsync("git", ["-C", repoRoot, "worktree", "remove", "--force", worktreeName]);
-      console.log(`[daemon] Removed worktree: ${worktreeName}`);
+      // 1. Check for unstaged/uncommitted changes outside .claude/ and .vscode/
+      const ignorable = await onlyIgnorableChanges(worktreePath, logger);
+      if (!ignorable) {
+        logger?.log(`[daemon] Worktree "${worktreeName}" has uncommitted changes — preserving`);
+        await notifyUser("Worktree Preserved", `"${worktreeName}" has uncommitted changes.`, logger);
+        return;
+      }
+
+      // 2. Check if branch has commits beyond parent
+      const commits = await hasNewCommits(repoRoot, worktreeName, state.parentCommit, logger);
+      if (!commits) {
+        logger?.log(`[daemon] No commits on "${worktreeName}" — deleting`);
+        await removeWorktreeAndBranch(repoRoot, worktreeName, logger);
+        logger?.log(`[daemon] Removed worktree and branch: ${worktreeName}`);
+        return;
+      }
+
+      // 3. Has commits — check if merged into parent
+      const merged = await isBranchMerged(repoRoot, worktreeName, state.parentBranch, logger);
+      if (merged) {
+        logger?.log(`[daemon] Branch "${worktreeName}" is merged into "${state.parentBranch}" — deleting`);
+        await removeWorktreeAndBranch(repoRoot, worktreeName, logger);
+        logger?.log(`[daemon] Removed worktree and branch: ${worktreeName}`);
+        return;
+      }
+
+      // Has unmerged commits — preserve
+      logger?.log(`[daemon] Worktree "${worktreeName}" has unmerged commits — preserving`);
+      await notifyUser("Worktree Preserved", `"${worktreeName}" has unmerged commits.`, logger);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
-      console.error(`[daemon] Failed to remove worktree "${worktreeName}": ${msg}`);
+      logger?.error(`[daemon] Error evaluating cleanup for "${worktreeName}": ${msg}`);
+      // On error, preserve the worktree to be safe
     }
   }
 
@@ -108,14 +138,24 @@ export function createDaemonServer(
 
         try {
           const msg = JSON.parse(line);
-          if (msg.type === "heartbeat" && typeof msg.worktree === "string") {
-            heartbeats.set(msg.worktree, Date.now());
+          if (msg.type === "register" && typeof msg.worktree === "string" && msg.parentBranch && msg.parentCommit) {
+            heartbeats.set(msg.worktree, {
+              lastHeartbeat: Date.now(),
+              parentBranch: msg.parentBranch,
+              parentCommit: msg.parentCommit,
+            });
+            lastActivityTime = Date.now();
+            logger?.log(`[daemon] Registered worktree "${msg.worktree}" (parent: ${msg.parentBranch}@${msg.parentCommit.slice(0, 7)})`);
+          } else if (msg.type === "heartbeat" && typeof msg.worktree === "string") {
+            const existing = heartbeats.get(msg.worktree);
+            if (existing) {
+              existing.lastHeartbeat = Date.now();
+            } else {
+              heartbeats.set(msg.worktree, { lastHeartbeat: Date.now(), parentBranch: "", parentCommit: "" });
+            }
             lastActivityTime = Date.now();
             const seqStr = typeof msg.seq === "number" ? ` #${msg.seq}` : "";
-            if (!cfg.silent) {
-              console.log(`[daemon] Received heartbeat${seqStr} ← "${msg.worktree}"`);
-            }
-            logToFile(`[daemon] Received heartbeat${seqStr} ← "${msg.worktree}"`);
+            logger?.log(`[daemon] Received heartbeat${seqStr} <- "${msg.worktree}"`);
           }
         } catch {
           // Ignore malformed messages
@@ -129,14 +169,13 @@ export function createDaemonServer(
   });
 
   server.listen(socketPath, () => {
-    console.log(`[daemon] Listening on ${socketPath}`);
-    logToFile(`[daemon] Listening on ${socketPath}`);
+    logger?.log(`[daemon] Listening on ${socketPath}`);
     events.emit("listening");
   });
 
   server.on("error", (err: NodeJS.ErrnoException) => {
     if (err.code === "EADDRINUSE") {
-      console.error(`[daemon] Socket already in use: ${socketPath}`);
+      logger?.error(`[daemon] Socket already in use: ${socketPath}`);
     }
     events.emit("error", err);
   });
@@ -144,21 +183,20 @@ export function createDaemonServer(
   const checkInterval = setInterval(async () => {
     const now = Date.now();
 
-    const expired: string[] = [];
-    for (const [worktree, lastSeen] of heartbeats) {
-      if (now - lastSeen > cfg.heartbeatTimeoutMs) {
-        expired.push(worktree);
+    const expired: Array<{ name: string; state: WorktreeState }> = [];
+    for (const [worktree, state] of heartbeats) {
+      if (now - state.lastHeartbeat > cfg.heartbeatTimeoutMs) {
+        expired.push({ name: worktree, state });
       }
     }
-    for (const worktree of expired) {
-      heartbeats.delete(worktree);
-      await cleanupWorktree(worktree);
+    for (const { name, state } of expired) {
+      heartbeats.delete(name);
+      await cleanupWorktree(name, state);
     }
 
     if (heartbeats.size === 0 && now - lastActivityTime > cfg.idleShutdownMs) {
-      console.log("[daemon] Idle — shutting down");
-      logToFile("[daemon] Idle — shutting down");
-      logToFile("=== SESSION END (idle-shutdown) ===");
+      logger?.log("[daemon] Idle — shutting down");
+      logger?.log("=== SESSION END (idle-shutdown) ===");
       events.emit("idle-shutdown");
       shutdown();
     }
@@ -172,7 +210,7 @@ export function createDaemonServer(
       } catch {
         // Already cleaned up
       }
-      console.log("[daemon] Shut down");
+      logger?.log("[daemon] Shut down");
     });
   }
 

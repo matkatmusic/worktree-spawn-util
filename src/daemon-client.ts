@@ -1,7 +1,7 @@
 // heartbeat/client — heartbeat sending logic extracted for testability
 
 import { createConnection } from "node:net";
-import { appendFile } from "node:fs/promises";
+import type { Logger } from "./logger.js";
 
 /** Parse --repo-root and --worktree from CLI args. */
 export function parseArgs(args: string[]): { repoRoot: string; worktree: string } {
@@ -24,25 +24,20 @@ export function parseArgs(args: string[]): { repoRoot: string; worktree: string 
 let heartbeatCount = 0;
 
 /** Send a single heartbeat message to the daemon over a Unix socket. */
-export function sendHeartbeat(socketPath: string, worktreeName: string, silent?: boolean, logFile?: string): void {
+export function sendHeartbeat(socketPath: string, worktreeName: string, logger?: Logger): void {
   heartbeatCount++;
   const seq = heartbeatCount;
   const client = createConnection({ path: socketPath }, () => {
     const msg = JSON.stringify({ type: "heartbeat", worktree: worktreeName, seq }) + "\n";
     client.write(msg, () => {
-      if (!silent) {
-        console.log(`[heartbeat] Sent #${seq} → "${worktreeName}"`);
-      }
-      if (logFile) {
-        appendFile(logFile, `[${new Date().toISOString()}] [heartbeat] Sent #${seq} → "${worktreeName}"\n`).catch(() => {});
-      }
+      logger?.log(`[heartbeat] Sent #${seq} -> "${worktreeName}"`);
       client.end();
     });
   });
 
   client.on("error", (err: NodeJS.ErrnoException) => {
     if (err.code === "ENOENT" || err.code === "ECONNREFUSED") {
-      console.warn(`[heartbeat] Daemon not reachable at ${socketPath} — will retry`);
+      logger?.warn(`[heartbeat] Daemon not reachable at ${socketPath} — will retry`);
     }
   });
 

@@ -1,0 +1,222 @@
+## Scenario 5 Debate Results — Claude Analysis
+
+### IMPORTANT OBSERVATION: Implementation Mismatch
+
+The debate prompt shows `isBranchMerged` using `git branch --merged`, but the actual
+implementation in src/git.ts (line 118) uses `git merge-base --is-ancestor`. This is
+a BETTER choice. My analysis covers both approaches but focuses on the actual code.
+
+---
+
+### Question 1: Will `git branch --merged master` correctly include `testv1` after `git merge testv1`?
+
+**Yes, for regular merges (both fast-forward and --no-ff merge commits).**
+
+Per the git-branch documentation: "--merged is used to find all branches which can be
+safely deleted, since those branches are fully contained by HEAD." More precisely:
+"only branches merged into the named commit (i.e. the branches whose tip commits are
+reachable from the named commit) will be listed."
+
+After `git merge testv1` on master:
+- **Fast-forward merge**: master's tip IS testv1's tip (same commit). testv1's tip is
+  trivially reachable from master. Result: testv1 appears in `--merged master`. CORRECT.
+- **Merge commit (--no-ff)**: A merge commit is created with two parents: old master
+  tip and testv1's tip. testv1's tip is reachable from master via the second parent.
+  Result: testv1 appears in `--merged master`. CORRECT.
+
+The actual implementation uses `git merge-base --is-ancestor testv1 master`, which asks
+"is testv1's tip an ancestor of master's tip?" This is semantically identical to the
+`--merged` check and returns exit code 0 (true) for both merge types. CORRECT.
+
+### Question 2: Will `git log abc123..testv1 --oneline` still show commits after the merge?
+
+**Yes.** The `..` range operator shows commits reachable from `testv1` but NOT reachable
+from `abc123`. The merge on master does NOT move the testv1 branch pointer — it only moves
+master forward. testv1's tip still points to the same commits it had before the merge.
+
+Therefore `git log abc123..testv1 --oneline` will continue to show all commits made on
+testv1 after it diverged from abc123. `hasNewCommits()` returns `true`. CORRECT.
+
+The cleanup flow is:
+1. `onlyIgnorableChanges` -> true (worktree is clean or has only .claude/.vscode files)
+2. `hasNewCommits` -> true (testv1 has commits beyond abc123)
+3. Flow does NOT stop here because the actual daemon code (daemon-server.ts line 105)
+   checks `isBranchMerged` FIRST, before checking `hasNewCommits`
+4. `isBranchMerged` -> true -> shouldDelete = true
+
+This is the correct order. The daemon checks merge status first, and if merged, skips
+the hasNewCommits/onlyIgnorableChanges checks entirely. The prompt's "proposed cleanup
+logic" shows a different order (onlyIgnorableChanges -> hasNewCommits -> isBranchMerged)
+but the actual implementation prioritizes the merge check, which is more efficient and
+correct.
+
+### Question 3: Edge Cases
+
+#### Fast-forward merge
+- master moves forward to testv1's tip commit. Both `branch --merged` and
+  `merge-base --is-ancestor` correctly identify testv1 as merged. NO ISSUE.
+
+#### Merge commit (--no-ff)
+- A new merge commit is created with testv1's tip as a parent. Both detection methods
+  correctly identify testv1 as merged. NO ISSUE.
+
+#### Squash merge — CRITICAL BUG FOUND
+- `git merge --squash testv1` followed by `git commit` creates a NEW commit on master
+  that contains all of testv1's changes but has NO parent relationship to testv1's commits.
+  Per git-merge docs: squash "does not actually make a commit, move the HEAD, or record
+  $GIT_DIR/MERGE_HEAD (to cause the next git commit command to create a merge commit)."
+- The subsequent `git commit` creates a regular (non-merge) commit whose only parent is
+  the previous master tip.
+- `git branch --merged master` will NOT list testv1, because testv1's tip is NOT reachable
+  from master's new commit. They share no commit ancestry for testv1's unique commits.
+- `git merge-base --is-ancestor testv1 master` will also return exit code 1 (false).
+- `git branch -d testv1` will REFUSE to delete the branch ("not fully merged").
+- **Result: After a squash merge, `isBranchMerged` returns false. The daemon will then
+  check `hasNewCommits` (true) and `onlyIgnorableChanges` (true), and since hasNewCommits
+  is true but the branch is "not merged," the daemon will PRESERVE the worktree.**
+- **This is a false negative — the work IS integrated but the daemon doesn't know it.**
+- **Impact**: The worktree and branch are preserved unnecessarily. The user gets a
+  notification saying "has changes that need to be committed or stashed" even though the
+  work was already squash-merged. Not catastrophic (no data loss), but annoying.
+- **Fix options**:
+  1. Use `git cherry` or `git log --cherry-pick` to detect squash-merged content
+  2. Compare `git diff master..testv1` — if empty, the content is integrated regardless
+     of commit ancestry
+  3. Accept this limitation and document it (squash merges require manual cleanup)
+
+#### Rebase merge
+- If the user rebases testv1 onto master (creating new commits with different SHAs) and
+  then fast-forwards master:
+  - The ORIGINAL testv1 branch ref is NOT moved by rebase if the user rebased from a
+    different checkout. But typically `git rebase master` while ON testv1 rewrites testv1's
+    commits and moves the testv1 ref to the new tip.
+  - After rebase + ff merge: master points to the rebased tip = testv1's new tip.
+    `merge-base --is-ancestor testv1 master` returns true. CORRECT.
+  - If testv1 was NOT the branch being rebased (e.g., user rebased from master using
+    `git rebase testv1` on master, which is unusual), the original testv1 commits are
+    still separate. This is an unlikely edge case.
+- **Standard rebase workflow: NO ISSUE.**
+
+#### Worktree checkout state after merge on master
+- The worktree at `.worktrees/testv1` has `testv1` checked out. When the user runs
+  `git merge testv1` on master in the main repo, ONLY master's ref and working tree are
+  affected. The worktree's working tree, index, and HEAD are completely independent.
+- The worktree's files are NOT modified by the merge on master. NO ISSUE.
+
+### Question 4: Will `git worktree remove --force testv1` work while the branch is checked out?
+
+**Yes.** Per git-worktree docs, `remove` with `--force` removes an unclean worktree.
+The `--force` flag overrides the "unclean worktree" check, not the "branch checked out"
+check — but that's for `worktree add`, not `remove`.
+
+`git worktree remove` deletes the worktree directory and unregisters it from the worktree
+list. The branch ref itself is NOT deleted by this command. After removal, the branch
+is no longer "checked out in a linked worktree."
+
+The actual code (git.ts line 157):
+```
+await git.raw(["worktree", "remove", "--force", worktreeName]);
+```
+
+This uses the worktree NAME, not the path. Git resolves worktree names to paths
+internally. This will work. CORRECT.
+
+**Note**: If the worktree has untracked/modified files (like .vscode/tasks.json), the
+`--force` flag is required. Without it, `git worktree remove` refuses to remove "unclean"
+worktrees. The implementation correctly uses `--force`. CORRECT.
+
+### Question 5: Will `git branch -d testv1` work after the worktree is removed?
+
+**Yes, with conditions.**
+
+`git branch -d` requires the branch to be "fully merged in its upstream branch, or in
+HEAD if no upstream was set." Since testv1 is a local branch with no upstream:
+- If master (HEAD in the main worktree) has merged testv1: `-d` succeeds. CORRECT.
+- If squash-merged: `-d` FAILS because git doesn't consider testv1 merged (see Q3).
+  The code (git.ts line 158-162) catches this error silently. The branch will be
+  preserved, which is consistent with the daemon's decision to preserve the worktree
+  in this case — but in the merged path, the worktree was already removed, and now
+  the branch deletion fails silently. **This is a secondary squash-merge bug**: the
+  worktree is gone but the branch lingers.
+
+Wait — re-reading the code flow: if `isBranchMerged` returns false (squash merge case),
+`shouldDelete` stays false unless `!commits && ignorable`. Since `hasNewCommits` returns
+true, `shouldDelete` stays false, and `removeWorktreeAndBranch` is never called. So the
+branch-d failure only matters when `isBranchMerged` returned true, which means `branch -d`
+will also succeed. NO ISSUE for the regular merge path.
+
+**For the regular merge case**: After worktree remove, testv1 is no longer checked out
+anywhere. `git branch -d testv1` checks if testv1 is merged into HEAD. If the daemon is
+running `simpleGit(repoRoot)` where repoRoot's HEAD is master, and master has merged
+testv1, then `-d` succeeds. CORRECT.
+
+### Question 6: simpleGit(repoRoot) while worktree exists vs after removal
+
+**Both work correctly.**
+
+`simpleGit(repoRoot)` executes git commands with `-C <repoRoot>`, which targets the main
+working tree. Git operations like `branch --merged`, `merge-base`, `log`, and `branch -d`
+operate on the repository's object database and refs, which are SHARED between the main
+worktree and all linked worktrees. These commands work identically regardless of whether
+linked worktrees exist.
+
+The only concern would be if a command tried to modify the worktree's checked-out branch
+while the worktree still exists — git protects against this. But `branch -d` is called
+AFTER `worktree remove`, so this protection has already been cleared. CORRECT.
+
+**Order matters**: The code correctly calls `worktree remove` before `branch -d`. If the
+order were reversed, `branch -d` would fail because git refuses to delete a branch that
+is checked out in any worktree.
+
+---
+
+### Summary
+
+| Check | Regular Merge | Fast-Forward | Squash Merge | Rebase+FF |
+|-------|:---:|:---:|:---:|:---:|
+| isBranchMerged | PASS | PASS | **FAIL** | PASS |
+| hasNewCommits | PASS | PASS | PASS | PASS |
+| onlyIgnorableChanges | PASS | PASS | PASS | PASS |
+| worktree remove --force | PASS | PASS | N/A* | PASS |
+| branch -d | PASS | PASS | N/A* | PASS |
+
+*N/A for squash merge because the daemon correctly decides NOT to delete (but for the
+wrong reason — it thinks there's unmerged work when the work is actually integrated).
+
+### Verdict: Scenario 5 WORKS CORRECTLY for standard merges (fast-forward and merge commit).
+
+**One known limitation**: Squash merges are not detected as merged. This is a fundamental
+git limitation — squash merges intentionally break commit ancestry. The daemon's behavior
+in this case is SAFE (preserves the worktree) but SUBOPTIMAL (user must manually clean up).
+
+### Bonus: The actual implementation is BETTER than the proposed logic
+
+The debate prompt shows `isBranchMerged` using `git branch --merged`, but the actual code
+uses `git merge-base --is-ancestor`. Both produce the same result for this scenario, but
+`merge-base --is-ancestor` is:
+1. More direct — it's a boolean check, not a list parse
+2. More efficient — no string parsing of branch lists
+3. Less fragile — no regex/trim issues with branch name parsing
+
+The actual daemon code also checks `isBranchMerged` FIRST (before hasNewCommits), which
+means merged worktrees are cleaned up immediately without unnecessary git log queries.
+
+### Recommended Fix for Squash Merge Detection
+
+If squash merge support is desired, add a content-equivalence check:
+
+```typescript
+export async function isContentMerged(
+  repoRoot: string,
+  branch: string,
+  parentBranch: string,
+): Promise<boolean> {
+  const git = simpleGit(repoRoot);
+  // If there's no diff between the branches, the content is integrated
+  const diff = await git.raw(["diff", `${parentBranch}...${branch}`]);
+  return diff.trim().length === 0;
+}
+```
+
+This would catch squash merges by comparing content rather than commit ancestry. It should
+be used as a FALLBACK when `isBranchMerged` returns false, not as a replacement.

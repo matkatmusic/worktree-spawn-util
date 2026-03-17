@@ -1,0 +1,117 @@
+Scenario 5 Debate Synthesis
+============================
+Providers: Claude (claude-opus-4-20250514), Codex (gpt-5.4), Gemini
+Date: 2026-03-16
+
+Bottom line: Scenario 5 WORKS for standard merges (fast-forward and --no-ff).
+Two implementation bugs and one design limitation were identified.
+
+──────────────────────────────────────────────────────────────────────────
+
+Q1: Will `git branch --merged master` correctly include testv1 after merge?
+───────────────────────────────────────────────────────────────────────────
+CONSENSUS: Yes, for standard merges (fast-forward and --no-ff merge commits).
+All three providers agree: after a normal merge, testv1's tip is reachable
+from master, so it appears in --merged output.
+
+IMPLEMENTATION BUG (Codex + Gemini): While the worktree exists, `git branch`
+marks testv1 with a `+` prefix (not `*`). The isBranchMerged parser only
+strips `*`, so `+ testv1` won't match "testv1". Claude notes the actual
+implementation uses `git merge-base --is-ancestor`, which avoids this bug
+entirely. If the code still has a `git branch --merged` path, it needs fixing.
+
+RECOMMENDATION (all three): Use `git merge-base --is-ancestor testv1 master`
+instead of parsing `git branch --merged` output.
+
+Q2: Will `git log abc123..testv1 --oneline` still show commits after merge?
+───────────────────────────────────────────────────────────────────────────
+CONSENSUS: Yes, unanimously.
+Merging into master does NOT move the testv1 ref. The commits reachable from
+testv1 but not from abc123 remain unchanged. hasNewCommits() returns true.
+No disagreements.
+
+Q3: Are there edge cases where this would fail?
+───────────────────────────────────────────────────────────────────────────
+CONSENSUS: Yes — squash merges are a known blind spot. All three agree.
+
+- Squash merge: ALL THREE flag this. `git merge --squash` creates a new commit
+  with no parent lineage to testv1. isBranchMerged returns false. The worktree
+  is preserved unnecessarily (false negative — no data loss, but annoying).
+
+- Rebase merge / cherry-pick: Codex and Gemini flag this. If changes are
+  rebased onto master creating new SHAs without updating testv1's ref, Git
+  won't see testv1 as merged. Claude notes that the *standard* rebase workflow
+  (rebase while ON testv1, then ff-merge) works fine because testv1's ref
+  moves to the rebased tip.
+
+- Worktree isolation: All three confirm that merging on master does NOT affect
+  the worktree's files, index, or HEAD. No issue.
+
+CLAUDE'S FIX PROPOSAL: Add a content-equivalence fallback using
+`git diff parentBranch...branch` — if the diff is empty, content is integrated
+regardless of commit ancestry.
+
+Q4: Will `git worktree remove --force testv1` work?
+───────────────────────────────────────────────────────────────────────────
+CONSENSUS: Yes, unanimously.
+This is the designed use case. The branch is always checked out in its own
+worktree; `remove` cleans up the directory and .git/worktrees metadata.
+--force handles any uncommitted ignorable files. No disagreements.
+
+Q5: Will `git branch -d testv1` work after worktree removal?
+───────────────────────────────────────────────────────────────────────────
+CONSENSUS: Yes, with a caveat. All three agree on the basics.
+
+After worktree removal, testv1 is no longer checked out anywhere, so the
+"branch checked out in another worktree" protection is cleared.
+
+CAVEAT (Gemini): `git branch -d` checks if the branch is merged into the
+currently checked-out branch (HEAD), NOT into the specified parentBranch.
+If the main repo has `develop` checked out instead of `master`, and develop
+doesn't contain testv1's history, `-d` will fail with "not fully merged."
+
+GEMINI'S FIX: Use `git branch -D` (force delete) since you've already
+verified merge status via isBranchMerged. Or ensure parentBranch is checked
+out.
+
+CLAUDE: Notes the code correctly orders worktree remove BEFORE branch delete.
+Reversing this order would fail.
+
+Q6: simpleGit(repoRoot) while worktree exists vs. after removal?
+───────────────────────────────────────────────────────────────────────────
+CONSENSUS: Both work correctly for read-only ref queries. All three agree.
+
+Git operations (log, merge-base, branch --merged) use the shared object
+database and work identically regardless of linked worktrees. The only
+difference: while the worktree exists, Git tracks testv1 as checked out
+elsewhere, blocking branch deletion/mutation. After removal, that metadata
+is gone. No disagreements.
+
+──────────────────────────────────────────────────────────────────────────
+
+SUMMARY OF ISSUES FOUND (ordered by severity)
+──────────────────────────────────────────────────────────────────────────
+
+1. PARSING BUG — `+` prefix (Codex, Gemini)
+   If isBranchMerged uses `git branch --merged` and strips only `*`, it will
+   miss branches marked with `+` (checked out in linked worktrees).
+   FIX: Use `git merge-base --is-ancestor` instead. Claude confirms the
+   actual implementation already does this, so verify and remove any dead
+   `git branch --merged` parsing code.
+
+2. BRANCH DELETION CAVEAT (Gemini)
+   `git branch -d` checks merge status against HEAD, not against parentBranch.
+   If HEAD != parentBranch, deletion fails.
+   FIX: Use `git branch -D` since merge safety is already verified by
+   isBranchMerged, or pass `--merged <parentBranch>` validation separately.
+
+3. SQUASH MERGE BLIND SPOT (all three)
+   Squash merges break ancestry-based detection. Not catastrophic (worktree
+   is preserved, no data loss), but the user gets a false "needs attention"
+   notification.
+   FIX (optional): Add content-equivalence fallback via `git diff master...testv1`.
+   If diff is empty, content is integrated. Or document as a known limitation.
+
+VERDICT: Scenario 5 works correctly for the common case (standard merge).
+The two bugs (#1, #2) should be fixed. The squash merge limitation (#3) is
+a design decision — fix it or document it.

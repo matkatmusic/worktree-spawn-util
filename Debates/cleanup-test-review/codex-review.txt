@@ -1,0 +1,883 @@
+Reading prompt from stdin...
+OpenAI Codex v0.114.0 (research preview)
+--------
+workdir: /Users/matkatmusicllc/Programming/worktree-spawn-util
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: high
+reasoning summaries: none
+session id: 019cf9e1-bc75-7f42-8811-af59fefcb59c
+--------
+user
+## Debate: Review of test/cleanup-logic.test.ts
+
+### Context
+
+This is an E2E test file for a daemon's worktree cleanup logic. The daemon monitors git worktrees via heartbeats over Unix domain sockets. When heartbeats stop (IDE window closes), the daemon evaluates whether to delete or preserve the worktree based on git state.
+
+### The file under review
+
+Read and analyze `test/cleanup-logic.test.ts` in this repository. The file is ~500 lines.
+
+### Cleanup logic being tested (in src/daemon-server.ts)
+
+When heartbeats stop, the daemon runs this decision tree:
+1. Check for unstaged/uncommitted changes outside .claude/ and .vscode/
+   → If present: PRESERVE worktree, notify user
+2. Check if branch has commits beyond the parent commit
+   → If no commits: DELETE worktree + branch
+3. Check if branch was merged into parent branch
+   → If merged: DELETE worktree + branch
+   → If not merged: PRESERVE worktree, notify user
+
+### The 4 test cases
+
+- **Test 1**: No changes → expects DELETE
+- **Test 2**: Uncommitted file added → expects PRESERVE
+- **Test 3**: File committed, NOT merged → expects PRESERVE
+- **Test 4**: File committed, branch merged into parent → expects DELETE
+
+### Your Task
+
+Review the test file for:
+
+1. **Effectiveness**: Does each test actually verify what its PURPOSE/INTENT comment claims? Are the assertions sufficient to prove the cleanup logic works?
+
+2. **Coverage gaps**: Are there missing scenarios that should be tested? Consider:
+   - .vscode/ or .claude/ only changes (should be treated as ignorable)
+   - Mixed changes (some ignorable, some not)
+   - Staged but uncommitted changes
+   - Multiple commits
+   - Fast-forward merge vs --no-ff merge
+   - Empty worktree branch merged (trivial ancestor)
+   - Race conditions (heartbeat arrives during cleanup)
+   - Daemon crash/restart during cleanup
+   - Multiple worktrees being cleaned up simultaneously
+
+3. **Test infrastructure**: Is the E2E approach sound?
+   - Is the runHeartbeatCycle helper reliable?
+   - Are timeouts appropriate?
+   - Is cleanup (afterEach) thorough enough?
+   - Could tests interfere with each other?
+   - Is the loggedGit wrapper capturing enough?
+
+4. **Code quality**: Readability, maintainability, DRY violations, naming.
+
+5. **Risks**: What could cause flaky tests? What assumptions might break?
+
+Provide specific findings with line numbers and severity (Critical/High/Medium/Low/Nit).
+// E2E tests for the daemon's worktree cleanup decision logic.
+// Each test creates a real git repo, spawns a real daemon and heartbeat process,
+// kills the heartbeat to simulate IDE window close, and verifies whether the
+// daemon correctly deletes or preserves the worktree.
+// All output is written to test/e2e-test.log with ==SERVER== / ==CLIENT== prefixes.
+
+import { describe, it, expect, beforeEach, afterEach, beforeAll } from "vitest";
+import { mkdtemp, rm, writeFile, access, realpath } from "node:fs/promises";
+import { appendFileSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
+import { spawn, type ChildProcess } from "node:child_process";
+import { createConnection } from "node:net";
+import { simpleGit } from "simple-git";
+import { getSocketPath, isSocketAlive } from "../src/socket.js";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+// Path to compiled CLI scripts
+const DAEMON_JS = join(__dirname, "..", "dist", "cli", "daemon.js");
+const HEARTBEAT_JS = join(__dirname, "..", "dist", "cli", "heartbeat.js");
+
+// Short timeouts for fast tests
+// Heartbeat interval (500ms) must be shorter than timeout (3s)
+const HB_TIMEOUT = "3000";
+const CHECK_INTERVAL = "500";
+const HB_INTERVAL = "500";
+
+// Log file path — persists in test/ directory
+const LOG_FILE = join(__dirname, "e2e-test.log");
+
+function log(prefix: "SERVER" | "CLIENT", source: string, message: string): void {
+  /* PURPOSE/INTENT: Write a single prefixed, tagged log line to the shared E2E log file. */
+  appendFileSync(LOG_FILE, `==${prefix}== [${source}] ${message}\n`);
+}
+
+function loggedGit(cwd: string, prefix: "SERVER" | "CLIENT" = "SERVER") {
+  /* PURPOSE/INTENT: Create a simpleGit wrapper that logs every git command invocation
+     and its full output to the E2E log file, so the log captures the exact git state
+     at every point in the test. */
+  const git = simpleGit(cwd);
+  const originalRaw = git.raw.bind(git);
+
+  git.raw = (async (args: string[]) => {
+    /* PURPOSE/INTENT: Intercept git.raw() calls to log the command and its output. */
+    const cmd = `git ${args.join(" ")}`;
+    log(prefix, "git", `$ ${cmd}`);
+    const result = await originalRaw(args);
+    if (result.trim()) {
+      for (const line of result.trim().split("\n")) {
+        log(prefix, "git", `  ${line}`);
+      }
+    } else {
+      log(prefix, "git", `  (no output)`);
+    }
+    return result;
+  }) as typeof git.raw;
+
+  return git;
+}
+
+function waitForOutput(proc: ChildProcess, pattern: string, timeoutMs = 15000): Promise<void> {
+  /* PURPOSE/INTENT: Block until a specific string appears in a child process's stdout,
+     used to synchronize test flow with daemon/heartbeat process state (e.g., wait
+     until 3 heartbeats are received before killing the heartbeat). */
+  return new Promise((resolve, reject) => {
+    log("SERVER", "waitForOutput", `Waiting for pattern: "${pattern}" (timeout: ${timeoutMs}ms)`);
+    const timer = setTimeout(() => {
+      /* PURPOSE/INTENT: Reject the promise if the pattern is not found within the timeout. */
+      log("SERVER", "waitForOutput", `TIMEOUT waiting for "${pattern}" after ${timeoutMs}ms`);
+      reject(new Error(`Timeout waiting for "${pattern}"`));
+    }, timeoutMs);
+    proc.stdout?.on("data", (chunk: Buffer) => {
+      /* PURPOSE/INTENT: Check each chunk of stdout for the target pattern. */
+      if (chunk.toString().includes(pattern)) {
+        log("SERVER", "waitForOutput", `Pattern "${pattern}" matched`);
+        clearTimeout(timer);
+        resolve();
+      }
+    });
+    proc.on("exit", (code) => {
+      /* PURPOSE/INTENT: Fail fast if the process exits before the pattern appears. */
+      clearTimeout(timer);
+      log("SERVER", "waitForOutput", `Process exited with code ${code} before "${pattern}" appeared`);
+      reject(new Error(`Process exited before "${pattern}" appeared`));
+    });
+  });
+}
+
+function sendMessage(socketPath: string, msg: object): Promise<void> {
+  /* PURPOSE/INTENT: Send a single JSON message to the daemon over the Unix domain socket.
+     Used to send "register" messages that tell the daemon the parent branch/commit
+     for a worktree before heartbeats begin. */
+  const msgStr = JSON.stringify(msg);
+  log("CLIENT", "sendMessage", `Connecting to ${socketPath}`);
+  log("CLIENT", "sendMessage", `Sending: ${msgStr}`);
+  return new Promise((resolve, reject) => {
+    const client = createConnection({ path: socketPath }, () => {
+      /* PURPOSE/INTENT: Write the message once connected, then close. */
+      client.write(msgStr + "\n");
+      client.end();
+      log("CLIENT", "sendMessage", `Message sent and connection closed`);
+      resolve();
+    });
+    client.on("error", (err) => {
+      /* PURPOSE/INTENT: Log and propagate socket connection errors. */
+      log("CLIENT", "sendMessage", `ERROR: ${err.message}`);
+      reject(err);
+    });
+  });
+}
+
+async function branchExists(repoRoot: string, branchName: string): Promise<boolean> {
+  /* PURPOSE/INTENT: Check if a git branch exists in the repo. Used in test assertions
+     to verify whether the daemon deleted the worktree branch or preserved it. */
+  const git = loggedGit(repoRoot);
+  const result = await git.raw(["branch", "--list", branchName]);
+  const exists = result.trim().length > 0;
+  log("SERVER", "branchExists", `Branch "${branchName}": ${exists ? "EXISTS" : "NOT FOUND"} → returning ${exists}`);
+  return exists;
+}
+
+async function dirExists(path: string): Promise<boolean> {
+  /* PURPOSE/INTENT: Check if a directory exists on disk. Used in test assertions
+     to verify whether the daemon removed the worktree directory or preserved it. */
+  try {
+    await access(path);
+    log("SERVER", "dirExists", `Directory "${path}": EXISTS → returning true`);
+    return true;
+  } catch {
+    /* PURPOSE/INTENT: ENOENT means directory was deleted — expected in delete scenarios. */
+    log("SERVER", "dirExists", `Directory "${path}": NOT FOUND → returning false`);
+    return false;
+  }
+}
+
+async function waitForSocket(socketPath: string, timeoutMs = 5000): Promise<void> {
+  /* PURPOSE/INTENT: Poll the daemon's Unix socket until it accepts connections.
+     The daemon needs a moment to start and bind the socket after being spawned.
+     Without this, the register message and heartbeats would fail with ENOENT. */
+  log("SERVER", "waitForSocket", `Polling socket ${socketPath} (timeout: ${timeoutMs}ms)`);
+  const start = Date.now();
+  let attempts = 0;
+  while (Date.now() - start < timeoutMs) {
+    /* PURPOSE/INTENT: Try connecting every 100ms until the socket responds. */
+    attempts++;
+    if (await isSocketAlive(socketPath)) {
+      log("SERVER", "waitForSocket", `Socket alive after ${attempts} attempts (${Date.now() - start}ms) → ready`);
+      return;
+    }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  log("SERVER", "waitForSocket", `TIMEOUT after ${attempts} attempts (${timeoutMs}ms) → throwing`);
+  throw new Error(`Daemon socket not ready after ${timeoutMs}ms`);
+}
+
+describe("cleanup logic — E2E", () => {
+  let repoRoot: string;
+  let testStartCommit: string;
+  let socketPath: string;
+  let daemonProc: ChildProcess | null;
+  let heartbeatProc: ChildProcess | null;
+
+  beforeEach(async () => {
+    /* PURPOSE/INTENT: Set up a fresh git repo with a testRoot branch for each test.
+       Each test gets an isolated repo so worktree state doesn't leak between tests. */
+    daemonProc = null;
+    heartbeatProc = null;
+
+    // Append separator for this test run
+    appendFileSync(LOG_FILE, `\n${"=".repeat(60)}\n`);
+
+    // Create a real git repo in a temp directory
+    repoRoot = await realpath(await mkdtemp(join(tmpdir(), "e2e-cleanup-")));
+    log("SERVER", "beforeEach", `Created temp repo at ${repoRoot}`);
+
+    const git = loggedGit(repoRoot);
+    await git.init();
+
+    await git.raw(["config", "user.email", "test@test.com"]);
+    await git.raw(["config", "user.name", "Test"]);
+
+    // Initial commit on default branch
+    await writeFile(join(repoRoot, "README.md"), "initial\n");
+    await git.add(".");
+    await git.commit("initial commit");
+    const defaultBranch = (await git.raw(["symbolic-ref", "--short", "HEAD"])).trim();
+    log("SERVER", "beforeEach", `Initial commit on "${defaultBranch}"`);
+
+    // Create and checkout testRoot branch
+    await git.raw(["checkout", "-b", "testRoot"]);
+
+    // Capture the commit hash
+    testStartCommit = (await git.revparse(["HEAD"])).trim();
+    log("SERVER", "beforeEach", `TestStartCommit: ${testStartCommit}`);
+
+    // Compute the socket path
+    socketPath = await getSocketPath(repoRoot);
+    log("SERVER", "beforeEach", `Socket path: ${socketPath}`);
+    log("SERVER", "beforeEach", `Setup complete — ready for test`);
+  });
+
+  afterEach(async () => {
+    /* PURPOSE/INTENT: Tear down all processes and temp files after each test.
+       Kills daemon and heartbeat if still running, force-removes worktrees,
+       and deletes the temp repo directory. */
+    log("SERVER", "afterEach", `Starting teardown`);
+
+    // Kill heartbeat if still running
+    if (heartbeatProc && !heartbeatProc.killed) {
+      /* PURPOSE/INTENT: Ensure the heartbeat process is stopped so it doesn't
+         keep sending to a socket that's about to be cleaned up. */
+      log("CLIENT", "afterEach", `Killing heartbeat process (PID ${heartbeatProc.pid})`);
+      heartbeatProc.kill("SIGTERM");
+    } else {
+      log("CLIENT", "afterEach", `Heartbeat already stopped`);
+    }
+
+    // Kill daemon if still running
+    if (daemonProc && !daemonProc.killed) {
+      /* PURPOSE/INTENT: Stop the daemon so it releases the socket file and
+         doesn't interfere with the next test's daemon. */
+      log("SERVER", "afterEach", `Killing daemon process (PID ${daemonProc.pid})`);
+      daemonProc.kill("SIGTERM");
+      await new Promise((r) => setTimeout(r, 500));
+    } else {
+      log("SERVER", "afterEach", `Daemon already stopped`);
+    }
+
+    // Force-remove any remaining worktrees
+    const git = loggedGit(repoRoot);
+    try {
+      /* PURPOSE/INTENT: Git won't let us delete the repo dir if worktrees still
+         reference it, so we force-remove all non-main worktrees first. */
+      const list = await git.raw(["worktree", "list", "--porcelain"]);
+      const paths = list
+        .split("\n")
+        .filter((l) => l.startsWith("worktree "))
+        .map((l) => l.slice("worktree ".length))
+        .filter((p) => p !== repoRoot);
+      log("SERVER", "afterEach", `Found ${paths.length} worktrees to clean up`);
+      for (const p of paths) {
+        log("SERVER", "afterEach", `Force-removing worktree: ${p}`);
+        await git.raw(["worktree", "remove", "--force", p]).catch(() => {});
+      }
+    } catch {
+      log("SERVER", "afterEach", `Error listing worktrees (best effort)`);
+    }
+
+    log("SERVER", "afterEach", `Removing temp dir: ${repoRoot}`);
+    await rm(repoRoot, { recursive: true, force: true });
+    log("SERVER", "afterEach", `Teardown complete`);
+  }, 30000);
+
+  async function runHeartbeatCycle(worktreeName: string): Promise<string> {
+    /* PURPOSE/INTENT: Run a complete heartbeat lifecycle — spawn daemon, register worktree,
+       start heartbeat, wait for 3 heartbeats to confirm connectivity, kill heartbeat to
+       simulate IDE window close, then wait for the daemon to evaluate and execute cleanup.
+       Returns all daemon stdout for assertion matching. */
+    let daemonOutput = "";
+
+    // --- Spawn daemon ---
+    log("SERVER", "runHeartbeatCycle", `Spawning daemon with --heartbeat-timeout=${HB_TIMEOUT} --check-interval=${CHECK_INTERVAL}`);
+    daemonProc = spawn("node", [
+      DAEMON_JS, repoRoot,
+      `--heartbeat-timeout=${HB_TIMEOUT}`,
+      `--check-interval=${CHECK_INTERVAL}`,
+    ], { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, NODE_OPTIONS: "" } });
+    log("SERVER", "runHeartbeatCycle", `Daemon spawned (PID ${daemonProc.pid})`);
+
+    // Capture daemon stdout/stderr with ==SERVER== prefix
+    daemonProc.stdout?.on("data", (chunk: Buffer) => {
+      /* PURPOSE/INTENT: Pipe every line of daemon stdout into the log with ==SERVER== prefix,
+         and accumulate into daemonOutput for assertion matching after the cycle. */
+      const text = chunk.toString();
+      daemonOutput += text;
+      for (const line of text.split("\n").filter(Boolean)) {
+        appendFileSync(LOG_FILE, `==SERVER== ${line}\n`);
+      }
+    });
+    daemonProc.stderr?.on("data", (chunk: Buffer) => {
+      /* PURPOSE/INTENT: Capture daemon stderr (e.g., git errors) into the log. */
+      const text = chunk.toString();
+      daemonOutput += text;
+      for (const line of text.split("\n").filter(Boolean)) {
+        appendFileSync(LOG_FILE, `==SERVER== [stderr] ${line}\n`);
+      }
+    });
+    daemonProc.on("exit", (code) => {
+      /* PURPOSE/INTENT: Log when the daemon process exits, for debugging unexpected shutdowns. */
+      log("SERVER", "runHeartbeatCycle", `Daemon exited with code ${code}`);
+    });
+
+    // --- Wait for daemon socket ---
+    await waitForSocket(socketPath);
+
+    // --- Register worktree ---
+    log("CLIENT", "runHeartbeatCycle", `Registering worktree "${worktreeName}" (parent: testRoot@${testStartCommit.slice(0, 7)})`);
+    await sendMessage(socketPath, {
+      type: "register",
+      worktree: worktreeName,
+      parentBranch: "testRoot",
+      parentCommit: testStartCommit,
+    });
+    log("CLIENT", "runHeartbeatCycle", `Register sent, waiting 200ms for daemon to process`);
+    await new Promise((r) => setTimeout(r, 200));
+
+    // --- Spawn heartbeat ---
+    log("CLIENT", "runHeartbeatCycle", `Spawning heartbeat with --interval=${HB_INTERVAL}`);
+    heartbeatProc = spawn("node", [
+      HEARTBEAT_JS,
+      `--interval=${HB_INTERVAL}`,
+      "--repo-root", repoRoot,
+      "--worktree", worktreeName,
+    ], { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, NODE_OPTIONS: "" } });
+    log("CLIENT", "runHeartbeatCycle", `Heartbeat spawned (PID ${heartbeatProc.pid})`);
+
+    // Capture heartbeat stdout/stderr with ==CLIENT== prefix
+    heartbeatProc.stdout?.on("data", (chunk: Buffer) => {
+      /* PURPOSE/INTENT: Pipe heartbeat stdout into the log with ==CLIENT== prefix. */
+      for (const line of chunk.toString().split("\n").filter(Boolean)) {
+        appendFileSync(LOG_FILE, `==CLIENT== ${line}\n`);
+      }
+    });
+    heartbeatProc.stderr?.on("data", (chunk: Buffer) => {
+      /* PURPOSE/INTENT: Capture heartbeat stderr (e.g., connection warnings) into the log. */
+      for (const line of chunk.toString().split("\n").filter(Boolean)) {
+        appendFileSync(LOG_FILE, `==CLIENT== [stderr] ${line}\n`);
+      }
+    });
+    heartbeatProc.on("exit", (code) => {
+      /* PURPOSE/INTENT: Log heartbeat exit for debugging (expected after SIGTERM). */
+      log("CLIENT", "runHeartbeatCycle", `Heartbeat exited with code ${code}`);
+    });
+
+    // --- Wait for 3 heartbeats ---
+    log("SERVER", "runHeartbeatCycle", `Waiting for daemon to receive 3 heartbeats`);
+    await waitForOutput(daemonProc, "Received heartbeat #3");
+    log("SERVER", "runHeartbeatCycle", `3 heartbeats confirmed — connectivity verified`);
+
+    // --- Kill heartbeat (simulate IDE close) ---
+    log("CLIENT", "runHeartbeatCycle", `Killing heartbeat (PID ${heartbeatProc.pid}) — simulating IDE window close`);
+    heartbeatProc.kill("SIGTERM");
+    heartbeatProc = null;
+
+    // --- Wait for cleanup ---
+    log("SERVER", "runHeartbeatCycle", `Waiting for daemon cleanup (timeout=${HB_TIMEOUT}ms + check=${CHECK_INTERVAL}ms)`);
+    try {
+      await waitForOutput(daemonProc, "cleanup", 10000);
+      log("SERVER", "runHeartbeatCycle", `Cleanup detected in daemon output`);
+    } catch {
+      log("SERVER", "runHeartbeatCycle", `Cleanup output not detected within 10s timeout`);
+    }
+    log("SERVER", "runHeartbeatCycle", `Waiting 1s for git operations to complete`);
+    await new Promise((r) => setTimeout(r, 1000));
+    log("SERVER", "runHeartbeatCycle", `Heartbeat cycle complete — ready for verification`);
+
+    return daemonOutput;
+  }
+
+  it("test 1: deletes worktree when no changes were made", async () => {
+    /* PURPOSE/INTENT: Verify that when a worktree has no modifications and no commits,
+       the daemon deletes both the worktree directory and the branch after heartbeat stops. */
+    log("SERVER", "test1", `=== TEST 1: No changes to worktree ===`);
+    const git = loggedGit(repoRoot);
+    const wtPath = join(repoRoot, ".worktrees", "test");
+
+    log("SERVER", "test1", `Creating worktree "test" at ${wtPath}`);
+    await git.raw(["worktree", "add", "-b", "test", wtPath]);
+    log("SERVER", "test1", `Worktree created — no modifications will be made`);
+
+    const output = await runHeartbeatCycle("test");
+
+    log("SERVER", "test1", `--- Verification ---`);
+    const wtExists = await dirExists(wtPath);
+    const brExists = await branchExists(repoRoot, "test");
+    log("SERVER", "test1", `Result:   worktree=${wtExists}, branch=${brExists}`);
+    log("SERVER", "test1", `Expected: worktree=false, branch=false`);
+    log("SERVER", "test1", `Daemon output contains "Removed worktree and branch": ${output.includes("Removed worktree and branch: test")}`);
+
+    expect(wtExists).toBe(false);
+    expect(brExists).toBe(false);
+    expect(output).toContain("Removed worktree and branch: test");
+    log("SERVER", "test1", `=== TEST 1 PASSED ===`);
+  }, 30000);
+
+  it("test 2: preserves worktree when uncommitted file exists", async () => {
+    /* PURPOSE/INTENT: Verify that when a worktree has an uncommitted file (outside
+       .claude/.vscode), the daemon preserves the worktree and notifies the user. */
+    log("SERVER", "test2", `=== TEST 2: Uncommitted file in worktree ===`);
+    const git = loggedGit(repoRoot);
+    const wtPath = join(repoRoot, ".worktrees", "test");
+
+    log("SERVER", "test2", `Creating worktree "test" at ${wtPath}`);
+    await git.raw(["worktree", "add", "-b", "test", wtPath]);
+
+    log("CLIENT", "test2", `Writing uncommitted file: ${join(wtPath, "test.txt")}`);
+    await writeFile(join(wtPath, "test.txt"), "test\n");
+    log("CLIENT", "test2", `File written — deliberately NOT staging or committing`);
+
+    const output = await runHeartbeatCycle("test");
+
+    log("SERVER", "test2", `--- Verification ---`);
+    const wtExists = await dirExists(wtPath);
+    const brExists = await branchExists(repoRoot, "test");
+    log("SERVER", "test2", `Result:   worktree=${wtExists}, branch=${brExists}`);
+    log("SERVER", "test2", `Expected: worktree=true, branch=true`);
+    log("SERVER", "test2", `Daemon output contains "uncommitted changes": ${output.includes("uncommitted changes")}`);
+    log("SERVER", "test2", `Daemon output contains "preserving": ${output.includes("preserving")}`);
+
+    expect(wtExists).toBe(true);
+    expect(brExists).toBe(true);
+    expect(output).toContain("uncommitted changes");
+    expect(output).toContain("preserving");
+    log("SERVER", "test2", `=== TEST 2 PASSED ===`);
+  }, 30000);
+
+  it("test 3: preserves worktree when branch has unmerged commits", async () => {
+    /* PURPOSE/INTENT: Verify that when a worktree branch has commits that were NOT
+       merged back into the parent branch, the daemon preserves the worktree to
+       prevent losing the user's work. */
+    log("SERVER", "test3", `=== TEST 3: Committed but not merged ===`);
+    const git = loggedGit(repoRoot);
+    const wtPath = join(repoRoot, ".worktrees", "test");
+
+    log("SERVER", "test3", `Creating worktree "test" at ${wtPath}`);
+    await git.raw(["worktree", "add", "-b", "test", wtPath]);
+
+    const wtGit = loggedGit(wtPath, "CLIENT");
+    log("CLIENT", "test3", `Writing file: ${join(wtPath, "test.txt")}`);
+    await writeFile(join(wtPath, "test.txt"), "test\n");
+    log("CLIENT", "test3", `Staging file`);
+    await wtGit.add(".");
+    log("CLIENT", "test3", `Committing as "added test file"`);
+    await wtGit.commit("added test file");
+    const commitHash = (await wtGit.revparse(["HEAD"])).trim();
+    log("CLIENT", "test3", `Committed: ${commitHash}`);
+    log("CLIENT", "test3", `Deliberately NOT merging into testRoot`);
+
+    const output = await runHeartbeatCycle("test");
+
+    log("SERVER", "test3", `--- Verification ---`);
+    const wtExists = await dirExists(wtPath);
+    const brExists = await branchExists(repoRoot, "test");
+    log("SERVER", "test3", `Result:   worktree=${wtExists}, branch=${brExists}`);
+    log("SERVER", "test3", `Expected: worktree=true, branch=true`);
+    log("SERVER", "test3", `Daemon output contains "unmerged commits": ${output.includes("unmerged commits")}`);
+    log("SERVER", "test3", `Daemon output contains "preserving": ${output.includes("preserving")}`);
+
+    expect(wtExists).toBe(true);
+    expect(brExists).toBe(true);
+    expect(output).toContain("unmerged commits");
+    expect(output).toContain("preserving");
+    log("SERVER", "test3", `=== TEST 3 PASSED ===`);
+  }, 30000);
+
+  it("test 4: deletes worktree when branch is merged", async () => {
+    /* PURPOSE/INTENT: Verify that when a worktree branch has commits AND those commits
+       were merged back into the parent branch, the daemon safely deletes the worktree
+       and branch since the work is preserved in the parent. */
+    log("SERVER", "test4", `=== TEST 4: Committed and merged ===`);
+    const git = loggedGit(repoRoot);
+    const wtPath = join(repoRoot, ".worktrees", "test");
+
+    log("SERVER", "test4", `Creating worktree "test" at ${wtPath}`);
+    await git.raw(["worktree", "add", "-b", "test", wtPath]);
+
+    const wtGit = loggedGit(wtPath, "CLIENT");
+    log("CLIENT", "test4", `Writing file: ${join(wtPath, "test.txt")}`);
+    await writeFile(join(wtPath, "test.txt"), "test\n");
+    log("CLIENT", "test4", `Staging file`);
+    await wtGit.add(".");
+    log("CLIENT", "test4", `Committing as "added test file"`);
+    await wtGit.commit("added test file");
+    const commitHash = (await wtGit.revparse(["HEAD"])).trim();
+    log("CLIENT", "test4", `Committed: ${commitHash}`);
+
+    log("SERVER", "test4", `Merging "test" into "testRoot" (--no-ff to create merge commit)`);
+    await git.raw(["merge", "test", "--no-ff", "-m", "merge test"]);
+    const mergeCommit = (await git.revparse(["HEAD"])).trim();
+    log("SERVER", "test4", `Merge complete — merge commit: ${mergeCommit}`);
+
+    const output = await runHeartbeatCycle("test");
+
+    log("SERVER", "test4", `--- Verification ---`);
+    const wtExists = await dirExists(wtPath);
+    const brExists = await branchExists(repoRoot, "test");
+    log("SERVER", "test4", `Result:   worktree=${wtExists}, branch=${brExists}`);
+    log("SERVER", "test4", `Expected: worktree=false, branch=false`);
+    log("SERVER", "test4", `Daemon output contains "merged": ${output.includes("merged")}`);
+    log("SERVER", "test4", `Daemon output contains "Removed worktree and branch": ${output.includes("Removed worktree and branch: test")}`);
+
+    expect(wtExists).toBe(false);
+    expect(brExists).toBe(false);
+    expect(output).toContain("merged");
+    expect(output).toContain("Removed worktree and branch: test");
+    log("SERVER", "test4", `=== TEST 4 PASSED ===`);
+  }, 30000);
+});
+
+mcp startup: no servers
+codex
+Reviewing [test/cleanup-logic.test.ts](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/cleanup-logic.test.ts) against the daemon cleanup path. I’m reading the test file with line numbers and the corresponding logic in [src/daemon-server.ts](/Users/matkatmusicllc/Programming/worktree-spawn-util/src/daemon-server.ts) to check whether the assertions actually prove the intended behavior.
+exec
+/bin/zsh -lc 'nl -ba test/cleanup-logic.test.ts' in /Users/matkatmusicllc/Programming/worktree-spawn-util succeeded in 0ms:
+     1	// E2E tests for the daemon's worktree cleanup decision logic.
+     2	// Each test creates a real git repo, spawns a real daemon and heartbeat process,
+     3	// kills the heartbeat to simulate IDE window close, and verifies whether the
+     4	// daemon correctly deletes or preserves the worktree.
+     5	// All output is written to test/e2e-test.log with ==SERVER== / ==CLIENT== prefixes.
+     6	
+     7	import { describe, it, expect, beforeEach, afterEach, beforeAll } from "vitest";
+     8	import { mkdtemp, rm, writeFile, access, realpath } from "node:fs/promises";
+     9	import { appendFileSync } from "node:fs";
+    10	import { join, dirname } from "node:path";
+    11	import { tmpdir } from "node:os";
+    12	import { fileURLToPath } from "node:url";
+    13	import { spawn, type ChildProcess } from "node:child_process";
+    14	import { createConnection } from "node:net";
+    15	import { simpleGit } from "simple-git";
+    16	import { getSocketPath, isSocketAlive } from "../src/socket.js";
+    17	
+    18	const __filename = fileURLToPath(import.meta.url);
+    19	const __dirname = dirname(__filename);
+    20	
+exec
+/bin/zsh -lc 'rg -n "cleanup|heartbeat|merge|uncommitted|worktree" src/daemon-server.ts' in /Users/matkatmusicllc/Programming/worktree-spawn-util succeeded in 0ms:
+16:  heartbeatTimeoutMs: number;
+31:  heartbeats: Map<string, WorktreeState>;
+37:  heartbeatTimeoutMs: 15_000,
+47: * - `"cleanup"` (worktreeName: string) — when a worktree heartbeat times out
+57:  const heartbeats = new Map<string, WorktreeState>();
+71:        `worktree: (pending first heartbeat)\n` +
+82:  async function cleanupWorktree(worktreeName: string, state: WorktreeState): Promise<void> {
+83:    console.log(`[daemon] No heartbeat for "${worktreeName}" — evaluating cleanup`);
+84:    logToFile(`[daemon] No heartbeat for "${worktreeName}" — evaluating cleanup`);
+85:    events.emit("cleanup", worktreeName);
+89:      await execFileAsync("tmux", ["kill-session", "-t", worktreeName]);
+90:      console.log(`[daemon] Killed tmux session: ${worktreeName}`);
+95:    const worktreePath = join(repoRoot, ".worktrees", worktreeName);
+99:      console.log(`[daemon] No parent info for "${worktreeName}" — force deleting`);
+102:        await removeWorktreeAndBranch(repoRoot, worktreeName);
+103:        console.log(`[daemon] Removed worktree and branch: ${worktreeName}`);
+104:        logToFile(`[daemon] Removed worktree and branch: ${worktreeName}`);
+107:        console.error(`[daemon] Failed to remove worktree "${worktreeName}": ${msg}`);
+113:      // 1. Check for unstaged/uncommitted changes outside .claude/ and .vscode/
+114:      const ignorable = await onlyIgnorableChanges(worktreePath);
+codex
+I have the main structure. Next I’m checking the exact cleanup implementation and the Vitest execution model, because several of the risks here depend on whether the tests are matching the daemon’s real branch/merge checks and whether files can run in parallel.
+exec
+/bin/zsh -lc "sed -n '80,170p' src/daemon-server.ts" in /Users/matkatmusicllc/Programming/worktree-spawn-util succeeded in 0ms:
+  }
+
+  async function cleanupWorktree(worktreeName: string, state: WorktreeState): Promise<void> {
+    console.log(`[daemon] No heartbeat for "${worktreeName}" — evaluating cleanup`);
+    logToFile(`[daemon] No heartbeat for "${worktreeName}" — evaluating cleanup`);
+    events.emit("cleanup", worktreeName);
+
+    // Always kill tmux session
+    try {
+      await execFileAsync("tmux", ["kill-session", "-t", worktreeName]);
+      console.log(`[daemon] Killed tmux session: ${worktreeName}`);
+    } catch {
+      // Session may not exist
+    }
+
+    const worktreePath = join(repoRoot, ".worktrees", worktreeName);
+
+    if (!state.parentBranch || !state.parentCommit) {
+      // No parent info — force delete (legacy behavior)
+      console.log(`[daemon] No parent info for "${worktreeName}" — force deleting`);
+exec
+/bin/zsh -lc 'rg -n "sequence|Received heartbeat|heartbeat #|cleanup" -S src dist test' in /Users/matkatmusicllc/Programming/worktree-spawn-util succeeded in 0ms:
+src/daemon-server.ts:47: * - `"cleanup"` (worktreeName: string) — when a worktree heartbeat times out
+src/daemon-server.ts:82:  async function cleanupWorktree(worktreeName: string, state: WorktreeState): Promise<void> {
+src/daemon-server.ts:83:    console.log(`[daemon] No heartbeat for "${worktreeName}" — evaluating cleanup`);
+src/daemon-server.ts:84:    logToFile(`[daemon] No heartbeat for "${worktreeName}" — evaluating cleanup`);
+src/daemon-server.ts:85:    events.emit("cleanup", worktreeName);
+src/daemon-server.ts:150:      console.error(`[daemon] Error evaluating cleanup for "${worktreeName}": ${msg}`);
+src/daemon-server.ts:151:      logToFile(`[daemon] Error evaluating cleanup: ${msg}`);
+src/daemon-server.ts:192:              console.log(`[daemon] Received heartbeat${seqStr} ← "${msg.worktree}"`);
+src/daemon-server.ts:194:            logToFile(`[daemon] Received heartbeat${seqStr} ← "${msg.worktree}"`);
+src/daemon-server.ts:231:      await cleanupWorktree(name, state);
+test/cleanup-logic.test.ts:1:// E2E tests for the daemon's worktree cleanup decision logic.
+test/cleanup-logic.test.ts:159:describe("cleanup logic — E2E", () => {
+test/cleanup-logic.test.ts:176:    repoRoot = await realpath(await mkdtemp(join(tmpdir(), "e2e-cleanup-")));
+test/cleanup-logic.test.ts:260:       simulate IDE window close, then wait for the daemon to evaluate and execute cleanup.
+test/cleanup-logic.test.ts:340:    await waitForOutput(daemonProc, "Received heartbeat #3");
+test/cleanup-logic.test.ts:348:    // --- Wait for cleanup ---
+test/cleanup-logic.test.ts:349:    log("SERVER", "runHeartbeatCycle", `Waiting for daemon cleanup (timeout=${HB_TIMEOUT}ms + check=${CHECK_INTERVAL}ms)`);
+test/cleanup-logic.test.ts:351:      await waitForOutput(daemonProc, "cleanup", 10000);
+test/daemon.test.ts:93:  it("emits cleanup event when heartbeat times out", async () => {
+test/daemon.test.ts:118:      handle!.events.on("cleanup", (name: string) => resolve(name));
+exec
+/bin/zsh -lc 'rg -n "vitest|test" package.json vitest.config.* .' in /Users/matkatmusicllc/Programming/worktree-spawn-util succeeded in 0ms:
+package.json:15:    "test": "vitest run",
+package.json:16:    "test:watch": "vitest"
+package.json:24:    "vitest": "^3.0.9"
+./src/daemon-server.ts:1:// daemon/server — core daemon logic extracted for testability
+vitest.config.ts:1:import { defineConfig } from "vitest/config";
+vitest.config.ts:4:  test: {
+./src/daemon-client.ts:1:// heartbeat/client — heartbeat sending logic extracted for testability
+./Debates/heartbeat-review-prompt.txt:5:A per-repo daemon listens on a Unix domain socket and receives heartbeats from VS Code background tasks. When an IDE window closes, heartbeats stop, and the daemon automatically cleans up the worktree and tmux session. Supporting infrastructure includes socket utilities, diagnostic logging, an optional --visible monitor mode, and 66 tests.
+./Debates/heartbeat-review-prompt.txt:17:- `test/heartbeat.test.ts` — Updated for seq field in messages
+./Debates/heartbeat-review-prompt.txt:18:- `test/ide.test.ts` — Added tests for heartbeat task, daemon monitor, visible mode
+./Debates/heartbeat-review-prompt.txt:34:3. **Architecture** — Module boundaries, API design, testability, coupling
+./Debates/heartbeat-review-prompt.txt:250: // daemon/server — core daemon logic extracted for testability
+./Debates/heartbeat-review-prompt.txt:336: // heartbeat/client — heartbeat sending logic extracted for testability
+./Debates/heartbeat-review-prompt.txt:461:diff --git a/test/heartbeat.test.ts b/test/heartbeat.test.ts
+./Debates/heartbeat-review-prompt.txt:463:--- a/test/heartbeat.test.ts
+./Debates/heartbeat-review-prompt.txt:464:+++ b/test/heartbeat.test.ts
+./Debates/heartbeat-review-prompt.txt:466:     sendHeartbeat(testSocketPath, "my-feature");
+./Debates/heartbeat-review-prompt.txt:477:diff --git a/test/ide.test.ts b/test/ide.test.ts
+./Debates/heartbeat-review-prompt.txt:479:--- a/test/ide.test.ts
+./Debates/heartbeat-review-prompt.txt:480:+++ b/test/ide.test.ts
+exec
+/bin/zsh -lc "sed -n '1,80p' vitest.config.ts" in /Users/matkatmusicllc/Programming/worktree-spawn-utilexec
+/bin/zsh -lc "sed -n '1,80p' package.json" in /Users/matkatmusicllc/Programming/worktree-spawn-util succeeded in 0ms:
+import { defineConfig } from "vitest/config";
+
+export default defineConfig({
+  test: {
+    root: ".",
+  },
+});
+ succeeded in 0ms:
+{
+  "name": "worktree-spawn-util",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "wt-pick-repo": "dist/cli/pick-repo.js",
+    "wt-daemon": "dist/cli/daemon.js",
+    "wt-heartbeat": "dist/cli/heartbeat.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "simple-git": "^3.27.0"
+  },
+exec
+/bin/zsh -lc "sed -n '1,220p' src/git.ts" in /Users/matkatmusicllc/Programming/worktree-spawn-util succeeded in 0ms:
+// git module — worktree CRUD, branch operations, merge detection
+
+import { simpleGit } from "simple-git";
+import { join } from "node:path";
+import { access, mkdir } from "node:fs/promises";
+
+export type WorktreeInfo = {
+  path: string;
+  branch: string;
+};
+
+/** Result of the repo picker — the validated root of a git repository. */
+export type RepoSelection = {
+  repoRoot: string;
+  isValid: boolean;
+};
+
+/** Validate that a folder is a git repo and resolve to its root. */
+export async function validateRepo(folderPath: string): Promise<RepoSelection> {
+  const git = simpleGit(folderPath);
+codex
+The main weakness is in the synchronization helpers, not the Git setup itself. I’m drilling into the register/heartbeat ordering and how the daemon updates state, because that determines whether these are robust E2E tests or mostly “sleep and hope” tests.
+exec
+/bin/zsh -lc "sed -n '205,240p' src/daemon-server.ts" in /Users/matkatmusicllc/Programming/worktree-spawn-utilexec
+/bin/zsh -lc "sed -n '168,205p' src/daemon-server.ts" in /Users/matkatmusicllc/Programming/worktree-spawn-util succeeded in 0ms:
+  });
+
+  server.listen(socketPath, () => {
+    console.log(`[daemon] Listening on ${socketPath}`);
+    logToFile(`[daemon] Listening on ${socketPath}`);
+    events.emit("listening");
+  });
+
+  server.on("error", (err: NodeJS.ErrnoException) => {
+    if (err.code === "EADDRINUSE") {
+      console.error(`[daemon] Socket already in use: ${socketPath}`);
+    }
+    events.emit("error", err);
+  });
+
+  const checkInterval = setInterval(async () => {
+    const now = Date.now();
+
+    const expired: Array<{ name: string; state: WorktreeState }> = [];
+    for (const [worktree, state] of heartbeats) {
+ succeeded in 0ms:
+
+        try {
+          const msg = JSON.parse(line);
+          if (msg.type === "register" && typeof msg.worktree === "string" && msg.parentBranch && msg.parentCommit) {
+            heartbeats.set(msg.worktree, {
+              lastHeartbeat: Date.now(),
+              parentBranch: msg.parentBranch,
+              parentCommit: msg.parentCommit,
+            });
+            lastActivityTime = Date.now();
+            if (!cfg.silent) {
+              console.log(`[daemon] Registered worktree "${msg.worktree}" (parent: ${msg.parentBranch}@${msg.parentCommit.slice(0, 7)})`);
+            }
+            logToFile(`[daemon] Registered worktree "${msg.worktree}" (parent: ${msg.parentBranch}@${msg.parentCommit.slice(0, 7)})`);
+          } else if (msg.type === "heartbeat" && typeof msg.worktree === "string") {
+            const existing = heartbeats.get(msg.worktree);
+            if (existing) {
+              existing.lastHeartbeat = Date.now();
+            } else {
+              heartbeats.set(msg.worktree, { lastHeartbeat: Date.now(), parentBranch: "", parentCommit: "" });
+exec
+/bin/zsh -lc "nl -ba src/git.ts | sed -n '100,170p'" in /Users/matkatmusicllc/Programming/worktree-spawn-util succeeded in 0ms:
+   100	  const branches = await git.branchLocal();
+   101	  if (branches.all.includes(worktreeName)) {
+   102	    await git.raw(["worktree", "add", worktreePath, worktreeName]);
+   103	  } else {
+   104	    await git.raw(["worktree", "add", "-b", worktreeName, worktreePath]);
+   105	  }
+   106	
+   107	  return { path: worktreePath, branch: worktreeName };
+   108	}
+   109	
+   110	/** Check if a branch is fully merged into a parent branch. */
+   111	export async function isBranchMerged(
+   112	  repoRoot: string,
+   113	  branch: string,
+   114	  parentBranch: string,
+   115	): Promise<boolean> {
+   116	  const git = simpleGit(repoRoot);
+   117	  const merged = await git.raw(["branch", "--merged", parentBranch]);
+   118	  // git branch --merged prefixes with "* " (current), "+ " (worktree), or "  " (other)
+   119	  const mergedBranches = merged.split("\n").map((l) => l.replace(/^[*+]?\s+/, "").trim()).filter(Boolean);
+exec
+/bin/zsh -lc "sed -n '1,220p' src/cli/heartbeat.ts" in /Users/matkatmusicllc/Programming/worktree-spawn-util succeeded in 0ms:
+#!/usr/bin/env node
+
+// heartbeat CLI — thin wrapper around heartbeat/client.ts
+
+import { join } from "node:path";
+import { getSocketPath, getSocketDir } from "../socket.js";
+import { parseArgs, sendHeartbeat } from "../daemon-client.js";
+
+const allArgs = process.argv.slice(2);
+const silent = allArgs.includes("--silent");
+const intervalArg = allArgs.find((a) => a.startsWith("--interval="));
+const HEARTBEAT_INTERVAL_MS = parseInt(intervalArg?.split("=")[1] ?? "5000");
+const filteredArgs = allArgs.filter((a) => a !== "--silent" && !a.startsWith("--interval="));
+const { repoRoot, worktree } = parseArgs(filteredArgs);
+
+if (!repoRoot || !worktree) {
+  console.error("[heartbeat] Usage: heartbeat [--silent] --repo-root <path> --worktree <name>");
+  process.exit(1);
+}
+
+exec
+/bin/zsh -lc "sed -n '1,220p' src/daemon-client.ts" in /Users/matkatmusicllc/Programming/worktree-spawn-util succeeded in 0ms:
+// heartbeat/client — heartbeat sending logic extracted for testability
+
+import { createConnection } from "node:net";
+import { appendFile } from "node:fs/promises";
+
+/** Parse --repo-root and --worktree from CLI args. */
+export function parseArgs(args: string[]): { repoRoot: string; worktree: string } {
+  let repoRoot = "";
+  let worktree = "";
+
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--repo-root" && args[i + 1]) {
+      repoRoot = args[i + 1];
+      i++;
+    } else if (args[i] === "--worktree" && args[i + 1]) {
+      worktree = args[i + 1];
+      i++;
+    }
+  }
+
+codex
+**Findings**
+- `High` The suite can validate stale code instead of the source under review. It spawns compiled CLIs from [cleanup-logic.test.ts:22](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/cleanup-logic.test.ts#L22) and [cleanup-logic.test.ts:23](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/cleanup-logic.test.ts#L23), but `npm test` is only [package.json:15](/Users/matkatmusicllc/Programming/worktree-spawn-util/package.json#L15). If `dist/` is missing or stale, this file either fails for the wrong reason or passes against yesterday’s daemon.
+- `High` `runHeartbeatCycle` does not actually wait for cleanup to finish. It waits for the substring `"cleanup"` at [cleanup-logic.test.ts:351](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/cleanup-logic.test.ts#L351), which matches the daemon’s first `"evaluating cleanup"` log at [daemon-server.ts:83](/Users/matkatmusicllc/Programming/worktree-spawn-util/src/daemon-server.ts#L83), before `onlyIgnorableChanges`, commit checks, merge checks, or deletion complete. The fixed sleep at [cleanup-logic.test.ts:357](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/cleanup-logic.test.ts#L357) is just a timing guess, so these tests can race on slower machines.
+- `High` Test 1 does not prove the `"no commits"` branch it claims to cover. A freshly created branch is already trivially merged into its parent, and missing parent info would also delete. Because the assertions at [cleanup-logic.test.ts:383](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/cleanup-logic.test.ts#L383), [cleanup-logic.test.ts:384](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/cleanup-logic.test.ts#L384), and [cleanup-logic.test.ts:385](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/cleanup-logic.test.ts#L385) only check deletion, the test would still pass if `hasNewCommits()` were broken and the daemon deleted via the merge path at [daemon-server.ts:135](/Users/matkatmusicllc/Programming/worktree-spawn-util/src/daemon-server.ts#L135) instead of the no-commit path at [daemon-server.ts:123](/Users/matkatmusicllc/Programming/worktree-spawn-util/src/daemon-server.ts#L123).
+- `Medium` The logging helper does not do what its comment says. `loggedGit` claims to log every git command at [cleanup-logic.test.ts:40](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/cleanup-logic.test.ts#L40), but it only wraps `git.raw` at [cleanup-logic.test.ts:46](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/cleanup-logic.test.ts#L46). Important state changes like `add` and `commit` in [cleanup-logic.test.ts:187](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/cleanup-logic.test.ts#L187), [cleanup-logic.test.ts:188](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/cleanup-logic.test.ts#L188), [cleanup-logic.test.ts:435](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/cleanup-logic.test.ts#L435), and [cleanup-logic.test.ts:437](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/cleanup-logic.test.ts#L437) are missing from the trace, so the log is weaker than advertised for debugging failures.
+- `Medium` `waitForOutput` leaks listeners and generates misleading failure noise. It adds `stdout` and `exit` listeners at [cleanup-logic.test.ts:75](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/cleanup-logic.test.ts#L75) and [cleanup-logic.test.ts:83](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/cleanup-logic.test.ts#L83) but never removes them after resolve at [cleanup-logic.test.ts:80](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/cleanup-logic.test.ts#L80). That is why passing runs still emit `"Process exited before..."` lines in [e2e-test.log:70](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/e2e-test.log#L70). It makes the log harder to trust and will scale badly as more cases are added.
+- `Medium` Step-1 coverage is thin. The only dirty-worktree case is a plain unstaged file at [cleanup-logic.test.ts:389](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/cleanup-logic.test.ts#L389), but the actual production rule is path-based filtering in [git.ts:135](/Users/matkatmusicllc/Programming/worktree-spawn-util/src/git.ts#L135). There is no E2E proof for `.claude/`-only changes, `.vscode/`-only changes, mixed ignorable and non-ignorable changes, or staged-but-uncommitted changes.
+- `Low` Merge coverage is narrower than the contract. Test 4 only exercises `--no-ff` at [cleanup-logic.test.ts:480](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/cleanup-logic.test.ts#L480), while the implementation in [git.ts:111](/Users/matkatmusicllc/Programming/worktree-spawn-util/src/git.ts#L111) is ancestry-based and should also be locked down with a fast-forward case. Multiple-commit branches are also untested.
+- `Low` The helper design cannot exercise several important E2E scenarios. The suite is built around one `daemonProc`, one `heartbeatProc`, and one `runHeartbeatCycle()` at [cleanup-logic.test.ts:163](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/cleanup-logic.test.ts#L163), [cleanup-logic.test.ts:164](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/cleanup-logic.test.ts#L164), and [cleanup-logic.test.ts:257](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/cleanup-logic.test.ts#L257). That means there is no coverage for simultaneous worktree cleanup, heartbeat-arrives-during-cleanup races, or daemon restart/crash during evaluation.
+- `Nit` Code quality is mostly readable, but the file is over-commented and has at least one unused import at [cleanup-logic.test.ts:7](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/cleanup-logic.test.ts#L7). The repetitive `PURPOSE/INTENT` blocks add a lot of vertical noise without increasing test precision.
+
+Overall, the E2E shape is reasonable: each test gets a fresh temp repo and unique socket path, so direct repo-state interference is low. The main problems are stale-`dist` risk and timing-based synchronization, which weaken confidence in the results.
+
+I did not execute the suite here. The workspace is read-only, and this test writes temp repos plus [e2e-test.log](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/e2e-test.log).
+tokens used
+46,001
+**Findings**
+- `High` The suite can validate stale code instead of the source under review. It spawns compiled CLIs from [cleanup-logic.test.ts:22](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/cleanup-logic.test.ts#L22) and [cleanup-logic.test.ts:23](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/cleanup-logic.test.ts#L23), but `npm test` is only [package.json:15](/Users/matkatmusicllc/Programming/worktree-spawn-util/package.json#L15). If `dist/` is missing or stale, this file either fails for the wrong reason or passes against yesterday’s daemon.
+- `High` `runHeartbeatCycle` does not actually wait for cleanup to finish. It waits for the substring `"cleanup"` at [cleanup-logic.test.ts:351](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/cleanup-logic.test.ts#L351), which matches the daemon’s first `"evaluating cleanup"` log at [daemon-server.ts:83](/Users/matkatmusicllc/Programming/worktree-spawn-util/src/daemon-server.ts#L83), before `onlyIgnorableChanges`, commit checks, merge checks, or deletion complete. The fixed sleep at [cleanup-logic.test.ts:357](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/cleanup-logic.test.ts#L357) is just a timing guess, so these tests can race on slower machines.
+- `High` Test 1 does not prove the `"no commits"` branch it claims to cover. A freshly created branch is already trivially merged into its parent, and missing parent info would also delete. Because the assertions at [cleanup-logic.test.ts:383](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/cleanup-logic.test.ts#L383), [cleanup-logic.test.ts:384](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/cleanup-logic.test.ts#L384), and [cleanup-logic.test.ts:385](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/cleanup-logic.test.ts#L385) only check deletion, the test would still pass if `hasNewCommits()` were broken and the daemon deleted via the merge path at [daemon-server.ts:135](/Users/matkatmusicllc/Programming/worktree-spawn-util/src/daemon-server.ts#L135) instead of the no-commit path at [daemon-server.ts:123](/Users/matkatmusicllc/Programming/worktree-spawn-util/src/daemon-server.ts#L123).
+- `Medium` The logging helper does not do what its comment says. `loggedGit` claims to log every git command at [cleanup-logic.test.ts:40](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/cleanup-logic.test.ts#L40), but it only wraps `git.raw` at [cleanup-logic.test.ts:46](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/cleanup-logic.test.ts#L46). Important state changes like `add` and `commit` in [cleanup-logic.test.ts:187](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/cleanup-logic.test.ts#L187), [cleanup-logic.test.ts:188](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/cleanup-logic.test.ts#L188), [cleanup-logic.test.ts:435](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/cleanup-logic.test.ts#L435), and [cleanup-logic.test.ts:437](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/cleanup-logic.test.ts#L437) are missing from the trace, so the log is weaker than advertised for debugging failures.
+- `Medium` `waitForOutput` leaks listeners and generates misleading failure noise. It adds `stdout` and `exit` listeners at [cleanup-logic.test.ts:75](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/cleanup-logic.test.ts#L75) and [cleanup-logic.test.ts:83](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/cleanup-logic.test.ts#L83) but never removes them after resolve at [cleanup-logic.test.ts:80](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/cleanup-logic.test.ts#L80). That is why passing runs still emit `"Process exited before..."` lines in [e2e-test.log:70](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/e2e-test.log#L70). It makes the log harder to trust and will scale badly as more cases are added.
+- `Medium` Step-1 coverage is thin. The only dirty-worktree case is a plain unstaged file at [cleanup-logic.test.ts:389](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/cleanup-logic.test.ts#L389), but the actual production rule is path-based filtering in [git.ts:135](/Users/matkatmusicllc/Programming/worktree-spawn-util/src/git.ts#L135). There is no E2E proof for `.claude/`-only changes, `.vscode/`-only changes, mixed ignorable and non-ignorable changes, or staged-but-uncommitted changes.
+- `Low` Merge coverage is narrower than the contract. Test 4 only exercises `--no-ff` at [cleanup-logic.test.ts:480](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/cleanup-logic.test.ts#L480), while the implementation in [git.ts:111](/Users/matkatmusicllc/Programming/worktree-spawn-util/src/git.ts#L111) is ancestry-based and should also be locked down with a fast-forward case. Multiple-commit branches are also untested.
+- `Low` The helper design cannot exercise several important E2E scenarios. The suite is built around one `daemonProc`, one `heartbeatProc`, and one `runHeartbeatCycle()` at [cleanup-logic.test.ts:163](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/cleanup-logic.test.ts#L163), [cleanup-logic.test.ts:164](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/cleanup-logic.test.ts#L164), and [cleanup-logic.test.ts:257](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/cleanup-logic.test.ts#L257). That means there is no coverage for simultaneous worktree cleanup, heartbeat-arrives-during-cleanup races, or daemon restart/crash during evaluation.
+- `Nit` Code quality is mostly readable, but the file is over-commented and has at least one unused import at [cleanup-logic.test.ts:7](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/cleanup-logic.test.ts#L7). The repetitive `PURPOSE/INTENT` blocks add a lot of vertical noise without increasing test precision.
+
+Overall, the E2E shape is reasonable: each test gets a fresh temp repo and unique socket path, so direct repo-state interference is low. The main problems are stale-`dist` risk and timing-based synchronization, which weaken confidence in the results.
+
+I did not execute the suite here. The workspace is read-only, and this test writes temp repos plus [e2e-test.log](/Users/matkatmusicllc/Programming/worktree-spawn-util/test/e2e-test.log).

@@ -1,0 +1,271 @@
+## Code Review: test/cleanup-logic.test.ts
+### Reviewer: Claude Sonnet 4.6
+### Date: 2026-03-16
+
+---
+
+## Overall Assessment
+
+The test suite is well-structured, clearly intentioned, and demonstrates genuine care for
+debuggability (the dual ==SERVER==/ ==CLIENT== log prefix scheme is excellent). The E2E
+approach is appropriate for a system whose correctness depends on inter-process timing and
+real git state. That said, there are meaningful gaps in coverage, one critical infrastructure
+flaw, and several reliability risks that could produce intermittent failures in CI.
+
+---
+
+## 1. EFFECTIVENESS — Do tests prove what they claim?
+
+### Test 1 (no changes → delete) — ADEQUATE
+The three assertions (dirExists=false, branchExists=false, output contains "Removed worktree
+and branch: test") together prove both artifacts are removed and the correct code path was
+taken. No issues.
+
+### Test 2 (uncommitted file → preserve) — PARTIALLY ADEQUATE
+Lines 413-416: the test asserts output contains "uncommitted changes" and "preserving", and
+that both worktree dir and branch still exist. However, it does not verify that the file
+itself still exists inside the worktree. If the daemon somehow deleted the worktree dir and
+re-created the branch reference, the assertions would still pass (contrived, but the intent
+comment says "preserves worktree" — proving the file content survives strengthens that).
+More importantly: the test writes an untracked file. `git status --porcelain` will show it
+with `??` prefix. In `onlyIgnorableChanges` (git.ts:142-146), a `?? test.txt` line is
+parsed as filePath = "test.txt" (slice(3) of "?? test.txt"). This correctly does NOT start
+with ".claude/" or ".vscode/", so the logic returns false (preserve). The test is correct,
+but the comment says "uncommitted" when it really means "untracked". A staged-but-not-
+committed file (XY prefix) is a different status --porcelain format that the test never
+exercises.
+
+### Test 3 (committed, not merged → preserve) — ADEQUATE
+Assertions cover dir, branch, and output strings. The setup correctly commits in the
+worktree but does not merge, directly exercising the `hasNewCommits=true, isBranchMerged=false`
+path.
+
+### Test 4 (committed, merged → delete) — ADEQUATE WITH CAVEAT
+Uses `--no-ff` merge (line 481), which creates a true merge commit. The isBranchMerged
+check uses `git branch --merged parentBranch` (git.ts:117), which correctly identifies
+branches whose tips are reachable from the merge commit. This works. However, the test only
+covers one of two merge strategies — a fast-forward merge is not tested, even though the
+behavior of `git branch --merged` differs slightly for FF vs. non-FF (both should return
+true, but the test gives no confidence about the FF path).
+
+---
+
+## 2. COVERAGE GAPS
+
+### [Critical] No test for ignorable-only changes (.claude/ or .vscode/)
+The `onlyIgnorableChanges` function is the gatekeeper for the entire cleanup decision tree.
+If it returns true, the daemon proceeds to check commits; if false, it preserves. There is
+zero test coverage for the "only .claude/ changes present" path. A regression in
+`onlyIgnorableChanges` (e.g., a path prefix check that accidentally matches ".clauderc")
+would be invisible to the current suite. This is the most important missing test.
+
+Suggested test: write a file at `.claude/settings.json` inside the worktree, then verify
+the daemon DELETES (not preserves), because those changes are ignorable.
+
+### [High] No test for staged-but-not-committed changes
+Test 2 only covers untracked files. A file that has been `git add`ed but not committed has
+a different `status --porcelain` two-letter code (e.g., "A "). The path parsing in
+`onlyIgnorableChanges` (line 144 of git.ts: `line.slice(3)`) still correctly skips the
+two-character XY code plus the space, so it should work — but there is no test proving it.
+This is a distinct case worth covering explicitly.
+
+### [High] No test for mixed changes (ignorable + non-ignorable)
+A worktree with both `.claude/` changes AND a real user file should PRESERVE. The
+`onlyIgnorableChanges` function correctly uses `.every()` so a single non-ignorable file
+causes it to return false. But no test exercises this combination.
+
+### [Medium] Fast-forward merge not tested
+Test 4 uses `--no-ff`. A FF merge would leave the "test" branch tip as a direct ancestor of
+"testRoot", not a separate commit. `git branch --merged testRoot` handles this correctly,
+but without a test, a developer has no confidence the FF case works.
+
+### [Medium] Multiple commits on branch
+All tests use at most one commit. The `hasNewCommits` check uses `git log parentCommit..branch
+--oneline` (git.ts:130). Multiple commits are not exercised; a branch with 3 commits and no
+merge would still be treated identically to a branch with 1 commit, but the test suite does
+not prove it.
+
+### [Medium] Multiple worktrees cleaned up simultaneously
+The daemon processes expired worktrees in a `for...of` loop with `await` (daemon-server.ts
+lines 229-232), making cleanup sequential. If two worktrees time out in the same check
+interval, they're cleaned up one after the other. No test verifies this behavior — or that
+the second cleanup correctly uses its own state (parentBranch/parentCommit) rather than
+shared mutable state.
+
+### [Low] Empty-worktree branch trivially merged (ancestor check)
+When no commits are made, `hasNewCommits` returns false and the daemon deletes via the
+"no commits" path (not the "merged" path). This is tested in Test 1. However, git also
+considers an empty branch (pointing at the same commit as the parent) to be "merged" per
+`git branch --merged`. The two code paths lead to the same outcome, so this is not a bug,
+but it is not documented or tested.
+
+### [Low] Daemon crash/restart during cleanup
+No test covers the daemon being killed mid-cleanup (e.g., during the `removeWorktreeAndBranch`
+call). After restart, the heartbeats map is empty and no cleanup resumes. This is probably
+acceptable behavior, but it is undocumented and untested.
+
+---
+
+## 3. TEST INFRASTRUCTURE
+
+### [Critical] waitForOutput() has a double-resolve race condition
+Lines 64-90: The function registers both a `proc.stdout.on("data")` listener and a
+`proc.on("exit")` listener. If the process exits normally AFTER the pattern appears in the
+same async tick, both listeners can fire. The `resolve()` call will be swallowed (Promises
+are settled only once), so this case is harmless. But there is a more dangerous scenario:
+if stdout data arrives in multiple chunks and the pattern spans a chunk boundary (e.g.,
+"cleanup" split across two chunks as "cle" + "anup"), the pattern will never be matched.
+Node.js TCP/Unix socket chunks are not guaranteed to align to message boundaries. Given the
+short messages logged by the daemon, this is unlikely but non-zero. Buffering stdout to a
+string and re-checking on each append would be more robust.
+
+### [High] Cleanup (afterEach) does not wait for daemon socket to release before rm -rf
+Lines 222-227: after `daemonProc.kill("SIGTERM")` there is a fixed 500ms sleep, then
+`rm -rf repoRoot`. If the daemon is in the middle of a git operation (e.g., `git worktree
+remove`) when SIGTERM arrives, git may hold the repo locked briefly after the daemon process
+exits. The 500ms is a heuristic. On a slow CI machine or with a large repo, this could
+produce spurious EBUSY errors on the rm. A more robust approach: wait for `daemonProc` to
+emit `"exit"` before proceeding.
+
+### [High] waitForOutput() re-registers listeners on every call
+waitForOutput adds a new `"data"` listener to `proc.stdout` each time it is called. If the
+function is called multiple times on the same process (which happens — once for heartbeat #3
+and once for "cleanup"), listeners accumulate. Node.js will print a MaxListenersExceeded
+warning at >10 listeners, but more importantly, the second call registers on a stream that
+may already have buffered data that was consumed by the first call. In the current usage
+pattern (sequential calls, with process restarted per test), this is tolerable, but it is
+a latent bug.
+
+### [Medium] `beforeAll` is imported but never used (line 7)
+`beforeAll` is in the import list but no `beforeAll()` call appears in the file. Dead import.
+This is a nit but also suggests the test was originally more complex.
+
+### [Medium] Fixed 200ms sleep after register (line 378)
+After sending the register message, the code sleeps 200ms "for daemon to process". This is
+a heuristic. The register message is processed synchronously in the `socket.on("data")`
+handler; by the time `sendMessage` resolves (the TCP write has been flushed), the daemon has
+already processed it. The 200ms is unnecessary and slows tests. If synchronization is
+needed, the daemon could ack the register with a response message.
+
+### [Medium] Fixed 1000ms sleep at end of runHeartbeatCycle (line 357)
+After detecting "cleanup" in output, the code sleeps 1s "for git operations to complete".
+This is the same heuristic anti-pattern. The daemon logs "Removed worktree and branch: X"
+after the git operation completes (daemon-server.ts line 129). The test should wait for that
+specific log line, not an arbitrary sleep. Currently the test waits for "cleanup" (which is
+emitted before git operations begin), then sleeps 1s, which is fragile on slow machines.
+
+### [Medium] The `waitForOutput` for "cleanup" swallows its rejection (lines 350-355)
+The `waitForOutput(daemonProc, "cleanup", 10000)` call is wrapped in a try/catch that logs
+but does not fail the test. This means if cleanup never triggers, the test silently proceeds
+to the 1s sleep and then checks git state, which may be non-deterministic. The cleanup
+pattern should be required, not optional — if cleanup never happens, the test should fail
+loudly.
+
+### [Low] LOG_FILE is a module-level constant pointing into the source tree (line 32)
+`test/e2e-test.log` is written to the test/ directory in the source tree and persists across
+runs. It can grow unbounded and will contain output from all test runs interleaved without
+clear run boundaries (only "=" separators). Vitest does not clean this file. In CI, this
+file will accumulate across jobs. Either truncate it at the start of each test run
+(beforeAll) or use a per-run temp file.
+
+### [Low] loggedGit wrapper only intercepts git.raw(), not other simpleGit methods
+Lines 39-62: the wrapper monkey-patches `git.raw` but the test also calls `git.add()`,
+`git.commit()`, `git.revparse()`, etc. Those methods go through simpleGit's own internal
+`raw()` call (not the patched one), so they are not logged. This means the commit and add
+operations in tests 3 and 4 are invisible in the log. The "loggedGit" abstraction implies
+full coverage but delivers partial coverage.
+
+---
+
+## 4. CODE QUALITY
+
+### [Nit] Naming inconsistency: "runHeartbeatCycle" is too generic
+The function does much more than run a heartbeat cycle — it spawns the daemon, registers a
+worktree, starts heartbeats, simulates IDE close, and waits for cleanup. A name like
+`runFullCleanupScenario` or `spawnDaemonAndSimulateIDEClose` would be more accurate.
+
+### [Nit] `commitHash` variable captured but never used in test 3 (line 438) and test 4 (line 477)
+The commit hash is logged and stored but not used in any assertion. It could be removed
+(the log call on the line above already captures it), or it could be added to assertions
+to verify the daemon saw the correct commit.
+
+### [Nit] Duplicate worktree setup (lines 371, 397, 430, 466)
+All four tests create the worktree with the same `git.raw(["worktree", "add", "-b", "test", wtPath])`.
+This could be extracted into a `createTestWorktree()` helper or moved to beforeEach with
+a flag to suppress it, reducing duplication.
+
+### [Nit] Purpose/intent comments on single-line closures are verbose
+Comments like `/* PURPOSE/INTENT: Reject the promise if the pattern is not found... */` on
+a two-line timeout handler add noise. The code is clear without them. Reserve INTENT
+comments for non-obvious decisions.
+
+---
+
+## 5. RISKS AND FLAKINESS
+
+### [Critical] Timing dependency on heartbeat seq number "Received heartbeat #3"
+Line 340: `waitForOutput(daemonProc, "Received heartbeat #3")` relies on the daemon logging
+an exact string with sequence number "#3". This works only if:
+  a) The heartbeat process sends messages with a monotonically incrementing `seq` field.
+  b) The daemon receives them in order and logs them in order.
+  c) No buffering causes "#1", "#2", "#3" to arrive in a single chunk (handled correctly by
+     the chunk-based matching, but if they arrive as "...#2\n[daemon] Received heartbeat #3\n..."
+     in one chunk, the includes() check on that chunk will match on the first chunk containing
+     "#3").
+
+The current design works but is brittle: changing the heartbeat sequence numbering scheme
+would silently break all four tests without any compile-time indication.
+
+### [High] The daemon is spawned by path to dist/ (compiled output), not source
+Lines 22-23: the tests reference `dist/cli/daemon.js` and `dist/cli/heartbeat.js`. If the
+source is modified but `npm run build` is not re-run, the tests will test stale code. There
+is no guard against this. Vitest does not rebuild before running. The test comment says
+"Path to compiled CLI scripts" but provides no mechanism to enforce freshness.
+
+### [High] Single shared socketPath per test — no isolation between concurrent test runs
+`socketPath` is computed from `repoRoot` (a unique temp dir per test). Since each test gets
+its own `repoRoot`, the socket paths should be unique. However, `getSocketPath(repoRoot)` is
+opaque from this file; if it hashes the path and two different tempdir paths hash to the
+same value, tests will interfere. This is unlikely but worth verifying in `src/socket.ts`.
+
+### [Medium] No test for the "no parent info" fallback path (daemon-server.ts lines 97-109)
+The daemon has a legacy fallback: if parentBranch or parentCommit is missing, it force-
+deletes the worktree. This path is never exercised by the test suite.
+
+### [Medium] afterEach does not wait for "exit" event before rm -rf
+As noted in section 3. If daemon's cleanup git operations outlive the process exit signal,
+the temp dir removal can race with an in-progress git operation.
+
+### [Low] Tests depend on system git configuration (user identity)
+The beforeEach sets `user.email` and `user.name` on the temp repo, which is correct. However,
+if the system git config has `gpg.sign = true` or a commit template, the `git commit` calls
+inside the worktree (tests 3 and 4) use `wtGit` which is initialized with `worktreePath`,
+not `repoRoot`. The `git config --local` values set in beforeEach are on `repoRoot`'s `.git`,
+not on the worktree's `.git` (worktrees share the parent's `.git`). This should be fine
+because worktrees inherit config from the shared `.git` — but it is worth noting as an
+assumption.
+
+---
+
+## Summary Table
+
+| Severity | Finding |
+|----------|---------|
+| Critical | No test for ignorable-only changes (.claude/.vscode) |
+| Critical | waitForOutput() chunk-split pattern miss risk |
+| High     | Staged-but-not-committed changes not tested |
+| High     | Mixed ignorable/non-ignorable changes not tested |
+| High     | afterEach uses fixed sleep instead of waiting for exit event |
+| High     | Tests run against stale dist/ if not rebuilt |
+| High     | waitForOutput "cleanup" rejection is silently swallowed |
+| Medium   | FF merge path not tested |
+| Medium   | Multiple commits on branch not tested |
+| Medium   | Multiple worktrees simultaneous cleanup not tested |
+| Medium   | Fixed 200ms and 1000ms sleeps are heuristic timing |
+| Medium   | No test for "no parent info" legacy fallback path |
+| Medium   | beforeAll imported but unused |
+| Low      | LOG_FILE grows unbounded across CI runs |
+| Low      | loggedGit wrapper misses non-raw git calls |
+| Nit      | commitHash captured but not asserted |
+| Nit      | Duplicate worktree setup across all 4 tests |
+| Nit      | Verbose PURPOSE/INTENT comments on obvious code |

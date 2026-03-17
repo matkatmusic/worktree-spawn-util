@@ -3,17 +3,21 @@
 import { execFile, spawn } from "node:child_process";
 import { readFile, appendFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { createConnection } from "node:net";
 import { fileURLToPath } from "node:url";
 import * as readline from "node:readline/promises";
 import { promisify } from "node:util";
 import { validateRepo, createWorktree } from "../git.js";
 import { detectIde, launchIde, writeWorktreeTasksFile } from "../ide.js";
 import { getSocketPath, ensureSocketDir, isSocketAlive, getDaemonSessionName } from "../socket.js";
+import { Logger } from "../logger.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 const execFileAsync = promisify(execFile);
+
+const logger = new Logger();
 
 /** Replace characters invalid in git ref names with underscores. */
 function sanitizeWorktreeName(raw: string): string {
@@ -47,48 +51,61 @@ const visible = cliArgs.includes("--inspectHB");
 const rawName = cliArgs.find((a) => !a.startsWith("--")) ?? "";
 
 if (!rawName.trim()) {
-  console.error("[pick-repo] No worktree name provided.");
+  logger.error("[pick-repo] No worktree name provided.");
   process.exit(1);
 }
 
 const worktreeName = sanitizeWorktreeName(rawName.trim());
 
 if (!worktreeName) {
-  console.error("[pick-repo] Worktree name is empty after sanitization.");
+  logger.error("[pick-repo] Worktree name is empty after sanitization.");
   process.exit(1);
 }
 
 if (worktreeName !== rawName.trim()) {
-  console.log(`[pick-repo] Sanitized name: "${rawName.trim()}" → "${worktreeName}"`);
+  logger.log(`[pick-repo] Sanitized name: "${rawName.trim()}" -> "${worktreeName}"`);
 }
 
 // --- Repo picker ---
 const folder = await pickFolder();
 
 if (!folder) {
-  console.error("[pick-repo] No folder selected.");
+  logger.error("[pick-repo] No folder selected.");
   process.exit(1);
 }
 
-const selection = await validateRepo(folder);
+const selection = await validateRepo(folder, logger);
 
 if (!selection.isValid) {
-  console.error(`[pick-repo] Not a git repository: ${folder}`);
+  logger.error(`[pick-repo] Not a git repository: ${folder}`);
   process.exit(1);
 }
 
-console.log(`[pick-repo] Repo: ${selection.repoRoot}`);
+logger.log(`[pick-repo] Repo: ${selection.repoRoot}`);
+
+// --- Capture parent branch info before creating worktree ---
+let parentBranch = "";
+let parentCommit = "";
+try {
+  const branchResult = await execFileAsync("git", ["-C", selection.repoRoot, "symbolic-ref", "--short", "HEAD"]);
+  parentBranch = branchResult.stdout.trim();
+  const commitResult = await execFileAsync("git", ["-C", selection.repoRoot, "rev-parse", "HEAD"]);
+  parentCommit = commitResult.stdout.trim();
+  logger.log(`[pick-repo] Parent: ${parentBranch}@${parentCommit.slice(0, 7)}`);
+} catch {
+  logger.warn("[pick-repo] Could not determine parent branch/commit");
+}
 
 // --- Create worktree ---
 let worktreePath: string;
 try {
-  const result = await createWorktree(selection.repoRoot, worktreeName);
+  const result = await createWorktree(selection.repoRoot, worktreeName, logger);
   worktreePath = result.path;
-  console.log(`[pick-repo] Worktree created at: ${result.path}`);
-  console.log(`[pick-repo] Branch: ${result.branch}`);
+  logger.log(`[pick-repo] Worktree created at: ${result.path}`);
+  logger.log(`[pick-repo] Branch: ${result.branch}`);
 } catch (err: unknown) {
   const message = err instanceof Error ? err.message : String(err);
-  console.error(`[pick-repo] Failed to create worktree: ${message}`);
+  logger.error(`[pick-repo] Failed to create worktree: ${message}`);
   process.exit(1);
 }
 
@@ -104,7 +121,7 @@ if (!daemonAlive) {
 
   try {
     await execFileAsync("tmux", ["new-session", "-d", "-s", sessionName, daemonCmd]);
-    console.log(`[pick-repo] Started daemon in tmux session "${sessionName}"`);
+    logger.log(`[pick-repo] Started daemon in tmux session "${sessionName}"`);
   } catch {
     // tmux may not be available — fall back to detached spawn
     const daemonProc = spawn("node", [daemonPath, selection.repoRoot], {
@@ -112,23 +129,38 @@ if (!daemonAlive) {
       stdio: "ignore",
     });
     daemonProc.unref();
-    console.log(`[pick-repo] Started daemon (PID ${daemonProc.pid}) for ${selection.repoRoot}`);
+    logger.log(`[pick-repo] Started daemon (PID ${daemonProc.pid}) for ${selection.repoRoot}`);
   }
 
   // Poll until daemon socket is live (max 5s)
   const pollStart = Date.now();
   while (Date.now() - pollStart < 5000) {
     if (await isSocketAlive(socketPath)) {
-      console.log("[pick-repo] Daemon socket is live");
+      logger.log("[pick-repo] Daemon socket is live");
       break;
     }
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   if (!(await isSocketAlive(socketPath))) {
-    console.warn("[pick-repo] WARNING: Daemon socket not ready after 5s — worktree cleanup may not work");
+    logger.warn("[pick-repo] WARNING: Daemon socket not ready after 5s — worktree cleanup may not work");
   }
 } else {
-  console.log("[pick-repo] Daemon already running for this repo");
+  logger.log("[pick-repo] Daemon already running for this repo");
+}
+
+// --- Register worktree with daemon ---
+if (parentBranch && parentCommit) {
+  await new Promise<void>((resolve) => {
+    const regClient = createConnection({ path: socketPath }, () => {
+      regClient.write(JSON.stringify({ type: "register", worktree: worktreeName, parentBranch, parentCommit }) + "\n");
+      regClient.end();
+      resolve();
+    });
+    regClient.on("error", () => {
+      logger.warn("[pick-repo] Could not register worktree with daemon");
+      resolve();
+    });
+  });
 }
 
 // --- Create worktree tmux session (Claude top, terminal bottom) ---
@@ -143,20 +175,26 @@ try {
   await execFileAsync("tmux", [
     "select-pane", "-t", `${worktreeName}:0.0`,
   ]);
-  console.log(`[pick-repo] Created tmux session "${worktreeName}" with Claude + terminal`);
+  // Wait for Claude to initialize, then rename the conversation
+  await new Promise((resolve) => setTimeout(resolve, 3000));
+  await execFileAsync("tmux", [
+    "send-keys", "-t", `${worktreeName}:0.0`,
+    `/rename ${worktreeName}`, "Enter",
+  ]);
+  logger.log(`[pick-repo] Created tmux session "${worktreeName}" with Claude + terminal`);
 } catch {
-  console.log(`[pick-repo] Could not create tmux session (may already exist)`);
+  logger.log(`[pick-repo] Could not create tmux session (may already exist)`);
 }
 
 // --- Set up worktree IDE config ---
-const tasksStatus = await writeWorktreeTasksFile(worktreePath, worktreeName, selection.repoRoot, visible);
+const tasksStatus = await writeWorktreeTasksFile(worktreePath, worktreeName, selection.repoRoot, visible, logger);
 
 // --- Open IDE window ---
 const ide = detectIde();
 if (ide) {
-  launchIde(ide, worktreePath);
+  launchIde(ide, worktreePath, logger);
 } else {
-  console.log(`[pick-repo] Could not detect IDE. Open manually: ${worktreePath}`);
+  logger.log(`[pick-repo] Could not detect IDE. Open manually: ${worktreePath}`);
 }
 
 // --- Prompt to add .worktrees to .gitignore ---
@@ -186,8 +224,8 @@ if (!alreadyIgnored) {
     const suffix =
       gitignoreContent.endsWith("\n") || !gitignoreContent ? "" : "\n";
     await appendFile(gitignorePath, suffix + ".worktrees\n");
-    console.log("[pick-repo] Added .worktrees to .gitignore");
+    logger.log("[pick-repo] Added .worktrees to .gitignore");
   } else {
-    console.log("[pick-repo] Skipped — .worktrees/ will appear as untracked");
+    logger.log("[pick-repo] Skipped — .worktrees/ will appear as untracked");
   }
 }

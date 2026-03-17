@@ -6,6 +6,7 @@ import { dirname, join } from "node:path";
 import { getDaemonSessionName } from "./socket.js";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import type { Logger } from "./logger.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -47,13 +48,13 @@ export function detectIde(): IdeConfig | null {
 }
 
 /** Open a new IDE window at the given path. The process is detached so it outlives the caller. */
-export function launchIde(config: IdeConfig, worktreePath: string): void {
+export function launchIde(config: IdeConfig, worktreePath: string, logger?: Logger): void {
   const child = spawn(config.command, [worktreePath], {
     detached: true,
     stdio: "ignore",
   });
   child.unref();
-  console.log(`[ide] Opened ${config.command} at ${worktreePath}`);
+  logger?.log(`[ide] Opened ${config.command} at ${worktreePath}`);
 }
 
 export type TasksFileStatus = "created" | "updated" | "unchanged";
@@ -73,11 +74,11 @@ interface TasksJsonFile {
   tasks: Task[];
 }
 
-function addWorktreeSessionTask(existing: TasksJsonFile, worktreeName: string): Task[] {
+function addWorktreeSessionTask(existing: TasksJsonFile, worktreeName: string, logger?: Logger): Task[] {
   const tasks = Array.isArray(existing.tasks) ? existing.tasks : [];
   const label = `Worktree: ${worktreeName}`;
   if (tasks.some((t) => t.label === label)) {
-    console.log(`[ide] "${label}" task already exists in tasks.json`);
+    logger?.log(`[ide] "${label}" task already exists in tasks.json`);
     return tasks;
   }
 
@@ -95,11 +96,11 @@ function addWorktreeSessionTask(existing: TasksJsonFile, worktreeName: string): 
   return tasks;
 }
 
-function addHeartbeatTask(existing: TasksJsonFile, worktreeName: string, repoRoot: string, visible?: boolean): Task[] {
+function addHeartbeatTask(existing: TasksJsonFile, worktreeName: string, repoRoot: string, visible?: boolean, logger?: Logger): Task[] {
   const tasks = Array.isArray(existing.tasks) ? existing.tasks : [];
   const heartbeatLabel = `Heartbeat: ${worktreeName}`;
   if (tasks.some((t) => t.label === heartbeatLabel)) {
-    console.log(`[ide] "${heartbeatLabel}" task already exists in tasks.json`);
+    logger?.log(`[ide] "${heartbeatLabel}" task already exists in tasks.json`);
     return tasks;
   }
 
@@ -122,11 +123,11 @@ function addHeartbeatTask(existing: TasksJsonFile, worktreeName: string, repoRoo
   return tasks;
 }
 
-function addDaemonMonitorTask(existing: TasksJsonFile, worktreeName: string, sessionName: string): Task[] {
+function addDaemonMonitorTask(existing: TasksJsonFile, worktreeName: string, sessionName: string, logger?: Logger): Task[] {
   const tasks = Array.isArray(existing.tasks) ? existing.tasks : [];
   const label = "Daemon Monitor";
   if (tasks.some((t) => t.label === label)) {
-    console.log(`[ide] "${label}" task already exists in tasks.json`);
+    logger?.log(`[ide] "${label}" task already exists in tasks.json`);
     return tasks;
   }
 
@@ -144,9 +145,9 @@ function addDaemonMonitorTask(existing: TasksJsonFile, worktreeName: string, ses
   return tasks;
 }
 
-async function writeUpdatedTasks(tasksJson: TasksJsonFile, tasksPath: string): Promise<void> {
+async function writeUpdatedTasks(tasksJson: TasksJsonFile, tasksPath: string, logger?: Logger): Promise<void> {
   await writeFile(tasksPath, JSON.stringify(tasksJson, null, 2) + "\n");
-  console.log(`[ide] Updated tasks.json`);
+  logger?.log(`[ide] Updated tasks.json`);
 }
 
 /**
@@ -158,6 +159,7 @@ export async function writeWorktreeTasksFile(
   worktreeName: string,
   repoRoot?: string,
   visible?: boolean,
+  logger?: Logger,
 ): Promise<TasksFileStatus> {
   const tasksPath = join(worktreePath, ".vscode", "tasks.json");
   const sessionName = (visible && repoRoot) ? await getDaemonSessionName(repoRoot) : undefined;
@@ -175,18 +177,18 @@ export async function writeWorktreeTasksFile(
   if (existing) {
     const originalLength = Array.isArray(existing.tasks) ? existing.tasks.length : 0;
     if (repoRoot) {
-      existing.tasks = addHeartbeatTask(existing, worktreeName, repoRoot, visible);
+      existing.tasks = addHeartbeatTask(existing, worktreeName, repoRoot, visible, logger);
     }
-    existing.tasks = addWorktreeSessionTask(existing, worktreeName);
+    existing.tasks = addWorktreeSessionTask(existing, worktreeName, logger);
     if (visible && sessionName) {
-      existing.tasks = addDaemonMonitorTask(existing, worktreeName, sessionName);
+      existing.tasks = addDaemonMonitorTask(existing, worktreeName, sessionName, logger);
     }
 
     if (existing.tasks.length === originalLength) {
       return "unchanged";
     }
 
-    await writeUpdatedTasks(existing, tasksPath);
+    await writeUpdatedTasks(existing, tasksPath, logger);
     return "updated";
   } else {
     const tasksJson: TasksJsonFile = {
@@ -195,15 +197,15 @@ export async function writeWorktreeTasksFile(
     };
 
     if (repoRoot) {
-      tasksJson.tasks = addHeartbeatTask(tasksJson, worktreeName, repoRoot, visible);
+      tasksJson.tasks = addHeartbeatTask(tasksJson, worktreeName, repoRoot, visible, logger);
     }
-    tasksJson.tasks = addWorktreeSessionTask(tasksJson, worktreeName);
+    tasksJson.tasks = addWorktreeSessionTask(tasksJson, worktreeName, logger);
     if (visible && sessionName) {
-      tasksJson.tasks = addDaemonMonitorTask(tasksJson, worktreeName, sessionName);
+      tasksJson.tasks = addDaemonMonitorTask(tasksJson, worktreeName, sessionName, logger);
     }
 
     await mkdir(join(worktreePath, ".vscode"), { recursive: true });
-    await writeUpdatedTasks(tasksJson, tasksPath);
+    await writeUpdatedTasks(tasksJson, tasksPath, logger);
     return "created";
   }
 }
@@ -212,7 +214,7 @@ export async function writeWorktreeTasksFile(
  * Reload an IDE window via AppleScript.
  * Activates the app by bundle ID, opens Command Palette, types "Reload Window", presses Enter.
  */
-export async function reloadIdeWindow(bundleId: string): Promise<void> {
+export async function reloadIdeWindow(bundleId: string, logger?: Logger): Promise<void> {
   const script = `
     tell application id "${bundleId}"
       activate
@@ -228,10 +230,22 @@ export async function reloadIdeWindow(bundleId: string): Promise<void> {
   `;
   try {
     await execFileAsync("osascript", ["-e", script]);
-    console.log(`[ide] Reloaded IDE window`);
+    logger?.log(`[ide] Reloaded IDE window`);
   } catch {
-    console.log(
+    logger?.log(
       `[ide] Could not reload IDE window automatically. Use Command Palette > "Developer: Reload Window"`,
     );
+  }
+}
+
+/** Send a macOS system notification. */
+export async function notifyUser(title: string, message: string, logger?: Logger): Promise<void> {
+  try {
+    await execFileAsync("osascript", [
+      "-e",
+      `display notification "${message}" with title "${title}"`,
+    ]);
+  } catch {
+    // Notification failed — best effort
   }
 }

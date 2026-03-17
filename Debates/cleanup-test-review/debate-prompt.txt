@@ -1,0 +1,57 @@
+## Debate: Review of test/cleanup-logic.test.ts
+
+### Context
+
+This is an E2E test file for a daemon's worktree cleanup logic. The daemon monitors git worktrees via heartbeats over Unix domain sockets. When heartbeats stop (IDE window closes), the daemon evaluates whether to delete or preserve the worktree based on git state.
+
+### The file under review
+
+Read and analyze `test/cleanup-logic.test.ts` in this repository. The file is ~500 lines.
+
+### Cleanup logic being tested (in src/daemon-server.ts)
+
+When heartbeats stop, the daemon runs this decision tree:
+1. Check for unstaged/uncommitted changes outside .claude/ and .vscode/
+   → If present: PRESERVE worktree, notify user
+2. Check if branch has commits beyond the parent commit
+   → If no commits: DELETE worktree + branch
+3. Check if branch was merged into parent branch
+   → If merged: DELETE worktree + branch
+   → If not merged: PRESERVE worktree, notify user
+
+### The 4 test cases
+
+- **Test 1**: No changes → expects DELETE
+- **Test 2**: Uncommitted file added → expects PRESERVE
+- **Test 3**: File committed, NOT merged → expects PRESERVE
+- **Test 4**: File committed, branch merged into parent → expects DELETE
+
+### Your Task
+
+Review the test file for:
+
+1. **Effectiveness**: Does each test actually verify what its PURPOSE/INTENT comment claims? Are the assertions sufficient to prove the cleanup logic works?
+
+2. **Coverage gaps**: Are there missing scenarios that should be tested? Consider:
+   - .vscode/ or .claude/ only changes (should be treated as ignorable)
+   - Mixed changes (some ignorable, some not)
+   - Staged but uncommitted changes
+   - Multiple commits
+   - Fast-forward merge vs --no-ff merge
+   - Empty worktree branch merged (trivial ancestor)
+   - Race conditions (heartbeat arrives during cleanup)
+   - Daemon crash/restart during cleanup
+   - Multiple worktrees being cleaned up simultaneously
+
+3. **Test infrastructure**: Is the E2E approach sound?
+   - Is the runHeartbeatCycle helper reliable?
+   - Are timeouts appropriate?
+   - Is cleanup (afterEach) thorough enough?
+   - Could tests interfere with each other?
+   - Is the loggedGit wrapper capturing enough?
+
+4. **Code quality**: Readability, maintainability, DRY violations, naming.
+
+5. **Risks**: What could cause flaky tests? What assumptions might break?
+
+Provide specific findings with line numbers and severity (Critical/High/Medium/Low/Nit).

@@ -1,0 +1,315 @@
+Review of test/cleanup-logic.test.ts
+Reviewer: Claude Opus 4.6 (1M context)
+Date: 2025-07-24
+
+================================================================================
+1. EFFECTIVENESS
+================================================================================
+
+Each test does verify what its PURPOSE/INTENT comment claims. The assertion
+strategy is sound: every test checks three things -- directory existence, branch
+existence, and daemon output string matching. This triangulation makes false
+passes unlikely.
+
+However, there are nuances:
+
+[Medium] Lines 351, 421: waitForOutput waits for the string "cleanup" in the
+daemon output, but the daemon's actual log message is:
+
+    [daemon] No heartbeat for "test" -- evaluating cleanup
+
+The pattern "cleanup" is a substring of "evaluating cleanup", which works, but
+it is fragile. If the daemon's wording changed to e.g. "evaluating clean-up
+logic" or "entering cleanup phase", this pattern would still match
+coincidentally. A more precise pattern like "evaluating cleanup" would be
+slightly more reliable and self-documenting.
+
+[Low] Lines 384-386, 453-456, 494-499: The output assertions check for exact
+substrings like "Removed worktree and branch: test" and "uncommitted changes".
+These are coupled to the exact console.log strings in daemon-server.ts
+(lines 103, 116, 145). This is acceptable for E2E tests -- they SHOULD test
+the observable output -- but any rewording in the daemon will silently break
+these tests in a way that looks like a logic failure rather than a string
+mismatch. Consider extracting the key strings into shared constants, or at
+minimum, adding a comment in daemon-server.ts noting that these strings are
+asserted in tests.
+
+[Medium] Lines 384-386: Test 1 asserts output.toContain("Removed worktree and
+branch: test") but does NOT assert that the daemon output does NOT contain
+"uncommitted changes" or "unmerged commits" or "preserving". A bug where the
+daemon first logs "preserving" then deletes anyway would pass this test. Adding
+negative assertions would strengthen these tests:
+    expect(output).not.toContain("preserving");
+    expect(output).not.toContain("uncommitted changes");
+Same applies to Test 4 (line 497-499).
+
+[Low] Test 4 (line 497): expect(output).toContain("merged") is weak. The
+string "merged" appears as a substring in "unmerged commits" (which is the
+OPPOSITE case). If a bug caused the daemon to print "unmerged commits" in the
+merge scenario, this assertion would still pass. Should be:
+    expect(output).toContain('is merged into');
+This matches the actual daemon log: `Branch "${worktreeName}" is merged into
+"${state.parentBranch}"` (daemon-server.ts line 136).
+
+
+================================================================================
+2. COVERAGE GAPS
+================================================================================
+
+[High] Missing: .claude/ or .vscode/ only changes (ignorable changes).
+The onlyIgnorableChanges function (git.ts lines 135-147) treats changes
+exclusively in .claude/ or .vscode/ as ignorable, meaning the worktree should
+be DELETED even though there are uncommitted files. This is the most nuanced
+part of the decision tree and has ZERO test coverage. A test should:
+  - Create a worktree
+  - Write a file to .claude/settings.json (or .vscode/settings.json)
+  - NOT commit it
+  - Verify the daemon DELETES the worktree
+This is the single most important missing test.
+
+[High] Missing: Mixed changes (ignorable + non-ignorable).
+Complement to the above: create both .claude/foo.txt and src/app.ts, verify
+PRESERVE. This ensures onlyIgnorableChanges does not have an off-by-one or
+early-return bug.
+
+[Medium] Missing: Staged but uncommitted changes.
+Test 2 only creates an untracked file. It does not test the case where a file
+is `git add`-ed but not committed. The git status --porcelain output differs
+for staged vs. untracked files (e.g. "A  file.txt" vs "?? file.txt"), and
+onlyIgnorableChanges parses the porcelain output. A staged-but-uncommitted
+test would exercise a different code path in the status parsing.
+
+[Medium] Missing: Fast-forward merge.
+Test 4 uses --no-ff. If the daemon were called with a fast-forward merge
+(which is the default git merge behavior), isBranchMerged might behave
+differently because after a fast-forward merge the branch tip IS the parent
+tip. git branch --merged would return true, but hasNewCommits would return
+false first (since the parent now contains the same commit). The test should
+verify both paths arrive at DELETE, but for different reasons.
+
+Actually -- on closer inspection of the decision tree, a fast-forward merge
+would mean:
+  - hasNewCommits(testRoot, "test", parentCommit) checks log parentCommit..test
+  - After ff-merge, testRoot has advanced to include test's commits
+  - But hasNewCommits is checking the ORIGINAL parentCommit, not the current
+    testRoot HEAD. So hasNewCommits would return true (test has commits beyond
+    the original parent), and then isBranchMerged would return true.
+  - This actually exercises the same path as Test 4. So this is lower priority.
+
+[Medium] Missing: No parentBranch/parentCommit (legacy behavior).
+daemon-server.ts lines 97-110 handle the case where state.parentBranch or
+state.parentCommit is empty -- it does a force delete. This is the "legacy
+behavior" path and is completely untested. A test should send a heartbeat
+without a register message (or register with empty parentBranch/parentCommit)
+and verify force deletion.
+
+[Low] Missing: Multiple worktrees cleaned up simultaneously.
+The daemon processes expired heartbeats sequentially in a for-loop
+(daemon-server.ts lines 229-232). If two worktrees expire in the same check
+cycle, is there any interaction? Unlikely to be a bug source, but it's an
+untested dimension.
+
+[Low] Missing: Error path in cleanup.
+daemon-server.ts lines 148-153 catch errors during cleanup and preserve the
+worktree. This is a safety-critical path (data loss prevention on error) and
+has no test coverage. A test could use a worktree path that has been manually
+corrupted or deleted before the daemon evaluates it.
+
+[Low] Missing: Daemon crash/restart mid-cleanup.
+Hard to test at E2E level without instrumentation. Acceptable to skip.
+
+[Low] Missing: Race condition where heartbeat arrives during cleanup evaluation.
+The daemon uses sequential async processing (await cleanupWorktree inside the
+check interval), so a heartbeat arriving during cleanup would be processed on
+the next tick. The worktree has already been deleted from the heartbeats map
+(line 230) before cleanupWorktree runs, so a new heartbeat would create a fresh
+entry. This seems safe by design, but there is a subtle window where the
+heartbeat could arrive after the delete from the map but before the physical
+worktree removal. Not trivially testable at E2E level.
+
+
+================================================================================
+3. TEST INFRASTRUCTURE
+================================================================================
+
+[Critical] Lines 64-90: waitForOutput has a subtle bug. It registers a 'data'
+listener on proc.stdout EACH TIME it is called. In runHeartbeatCycle, it is
+called twice (line 340 for "Received heartbeat #3", line 351 for "cleanup").
+The first listener is never removed. After the first call resolves, the
+listener remains attached but its closure references a resolved/rejected
+promise and a cleared timer. This is not a correctness bug (the old listener's
+resolve/reject are no-ops after being called once), but:
+  a) It leaks listeners, which node will warn about if many calls are made
+  b) More importantly, the second call to waitForOutput could be resolved by
+     data that arrives and is processed by the FIRST listener's chunk handler
+     first. Since the first listener checks for "Received heartbeat #3" and
+     that string won't appear again, this is safe in practice. But if the
+     same pattern were searched twice, the stale listener would swallow it.
+Recommendation: Return a cleanup function from waitForOutput, or remove the
+listener in the resolve/reject callbacks.
+
+[High] Lines 346-347: heartbeatProc is set to null immediately after kill().
+The kill() call sends SIGTERM but does not wait for the process to actually
+exit. The afterEach cleanup (line 212) checks `heartbeatProc && !heartbeatProc
+.killed`, but heartbeatProc is already null at this point, so the cleanup
+always takes the "Heartbeat already stopped" branch. This is fine when the
+heartbeat was killed in runHeartbeatCycle, but if runHeartbeatCycle throws
+between spawning the heartbeat and killing it, heartbeatProc might be non-null
+and still running. The current code handles this correctly because heartbeatProc
+is set on line 312 and only nulled on line 346. If an error occurs between 312
+and 346, afterEach will correctly kill it.
+
+Wait -- re-reading: line 312 sets heartbeatProc to the spawn result. Line 346
+kills it and sets it to null. If runHeartbeatCycle throws after 312 but before
+346, heartbeatProc is still set, so afterEach will kill it. This is actually
+correct. Downgrading severity.
+
+[Medium] Line 227 (afterEach): After killing the daemon, there is a 500ms wait,
+but no wait for the process to actually exit. On a slow CI system, the daemon
+might not fully release the socket within 500ms. The next test's daemon would
+then encounter a stale socket. The daemon CLI (daemon.ts line 25-29) does call
+cleanStaleSocket, which checks isSocketAlive, so this should self-heal. But it
+introduces a potential race. Consider awaiting the 'exit' event instead:
+    await new Promise(r => daemonProc.on('exit', r));
+
+[Medium] Line 340: waitForOutput(daemonProc, "Received heartbeat #3") depends
+on the daemon printing heartbeat sequence numbers. This works because the
+daemon-client sends `seq` in the heartbeat message (daemon-client.ts line 31)
+and the daemon echoes it (daemon-server.ts line 190). However, the daemon
+only prints the sequence if `!cfg.silent` (line 191-193). If a future
+refactor adds --silent to the daemon spawn args, this test would silently
+hang for 15 seconds and then fail with a timeout. The test correctly does NOT
+pass --silent, but this coupling is undocumented.
+
+[Medium] Shared log file (LOG_FILE, line 32): All tests append to the same
+e2e-test.log file. If tests run in parallel (vitest's default for .test.ts
+files), log lines from different tests would interleave, making the log
+useless for debugging. The tests appear to be designed for sequential execution
+(they share describe-level state like repoRoot, daemonProc), so parallel
+execution would break them anyway. But there is no explicit `{ sequential: true
+}` or `describe.sequential` marker. Vitest runs files in parallel by default
+but tests within a file sequentially by default, so this is safe in practice.
+Still, adding an explicit marker would prevent accidental breakage.
+
+[Low] Lines 22-23: Tests depend on pre-compiled JS in dist/cli/daemon.js and
+dist/cli/heartbeat.js. If the developer forgets to run `npm run build` before
+running tests, they will get confusing errors about missing files or stale
+behavior. Consider adding a beforeAll that runs the build, or using tsx/ts-node
+to run the TypeScript source directly.
+
+[Low] Line 7: `beforeAll` is imported but never used.
+
+
+================================================================================
+4. CODE QUALITY
+================================================================================
+
+[Nit] PURPOSE/INTENT comments are verbose and repetitive. Every function, every
+callback, every catch block has one. While this demonstrates thoroughness, it
+reduces signal-to-noise. The function-level PURPOSE/INTENT comments are valuable
+(e.g., lines 64-66, 92-95, 257-261). The inline ones on trivial callbacks are
+noise (e.g., line 101 "Write the message once connected, then close" on a
+three-line callback that does exactly that). Consider keeping only the non-
+obvious ones.
+
+[Nit] Lines 34-37: The log() function type-constrains prefix to
+"SERVER" | "CLIENT" which is good, but the source parameter is a free-form
+string. A union type for common sources ("test1", "test2", "beforeEach",
+"afterEach", "runHeartbeatCycle", etc.) would catch typos.
+
+[Nit] The worktree name is hardcoded as "test" in all four tests. This means
+a copy-paste error where two tests share state is harder to detect. Consider
+using unique names like "test-nochange", "test-uncommitted", "test-unmerged",
+"test-merged" to make log output self-documenting.
+
+[Low] Lines 39-62: loggedGit only wraps git.raw(). Other methods like
+git.add(), git.commit(), git.init() (used in beforeEach) are NOT logged. This
+means the log file is missing several git operations that happen during setup.
+The tests call git.add(".") on line 505 and git.commit() on line 507 through
+the worktree simpleGit instance (wtGit = loggedGit(wtPath)), but loggedGit only
+intercepts .raw() calls. The .add() and .commit() methods are separate methods
+on the simpleGit object and do not go through .raw(). So those operations are
+NOT captured in the log.
+
+[Nit] DRY: Tests 1-4 have identical worktree creation boilerplate:
+    const wtPath = join(repoRoot, ".worktrees", "test");
+    await git.raw(["worktree", "add", "-b", "test", wtPath]);
+This could be extracted into a helper like createTestWorktree(git, repoRoot,
+name) that returns wtPath.
+
+[Nit] DRY: The verification block (dirExists + branchExists + logging +
+assertions) is repeated with slight variations in each test. A helper like
+assertWorktreeDeleted(repoRoot, wtPath, "test", output) and
+assertWorktreePreserved(repoRoot, wtPath, "test", output, reason) would reduce
+repetition and make the intent even clearer.
+
+
+================================================================================
+5. RISKS / FLAKINESS
+================================================================================
+
+[High] Timing sensitivity. The tests use:
+  - HB_TIMEOUT = 3000ms (heartbeat timeout)
+  - CHECK_INTERVAL = 500ms (daemon check interval)
+  - HB_INTERVAL = 500ms (heartbeat send interval)
+  - 1000ms fixed wait after cleanup detection (line 357)
+  - 200ms wait after register (line 308)
+  - 30s test timeout
+
+The worst-case time from killing heartbeat to cleanup completion is:
+  HB_TIMEOUT (3s) + CHECK_INTERVAL (0.5s) + git operations (~1s) = ~4.5s
+
+The waitForOutput call on line 351 has a 10s timeout, which gives 5.5s of
+margin. This should be adequate, but on an extremely loaded CI machine, git
+operations could take longer. The 1s fixed wait on line 357 is the weakest
+link: if the daemon's git operations (removeWorktreeAndBranch, which does
+`git worktree remove --force` and `git branch -D`) take longer than 1s, the
+test will check state before cleanup finishes and potentially pass or fail
+incorrectly.
+
+A more robust approach: wait for the daemon to print the final confirmation
+message ("Removed worktree and branch: test" or "preserving") rather than
+waiting for "cleanup" and then sleeping 1 second.
+
+[Medium] Socket path collision. getSocketPath uses sha256 of the realpath,
+truncated to 12 hex chars. Each test creates a new temp directory, so socket
+paths should be unique. But if two test runs happen simultaneously (e.g., in
+CI), they share the /tmp/wtsu-<uid>/ directory and could collide if two temp
+dirs hash to the same 12-char prefix. Probability is negligible (1 in 2^48)
+but worth noting.
+
+[Low] macOS-specific: The notifyUser function (ide.ts line 240) uses osascript.
+On Linux CI, this will fail silently (caught by try/catch in ide.ts), which is
+fine. But the tests are implicitly macOS-only because of the Unix domain socket
+assumption (though Unix sockets work on Linux too). No explicit platform guard
+exists.
+
+[Low] The daemon spawns tmux kill-session (daemon-server.ts line 89) during
+cleanup. If tmux is not installed on the test machine, this produces an error
+that is silently caught. This is correct behavior but could mask a real tmux-
+related bug.
+
+
+================================================================================
+SUMMARY
+================================================================================
+
+Overall assessment: The test file is well-structured, thorough in its logging,
+and correctly tests the four primary decision paths. The E2E approach of
+spawning real daemon and heartbeat processes is appropriate for this kind of
+system integration testing.
+
+Priority fixes (ranked):
+
+1. [High] Add test for .claude/.vscode-only changes (ignorable changes path)
+2. [High] Add test for mixed changes (ignorable + non-ignorable)
+3. [High] Replace the 1s sleep after "cleanup" detection with waiting for the
+   daemon's final decision message ("Removed worktree and branch" or
+   "preserving" or "unmerged commits" or "uncommitted changes")
+4. [Medium] Add negative assertions to DELETE tests (no "preserving" in output)
+5. [Medium] Fix weak "merged" substring match in Test 4
+6. [Medium] Add test for staged-but-uncommitted changes
+7. [Medium] Add test for legacy behavior (no parentBranch/parentCommit)
+8. [Medium] Clean up waitForOutput listeners after resolution
+9. [Low] Remove unused beforeAll import
+10. [Low] Use unique worktree names per test for clearer logs

@@ -8,3 +8,4 @@ export * from "./config.js";
 export * from "./socket.js";
 export * from "./daemon-server.js";
 export * from "./daemon-client.js";
+export * from "./logger.js";

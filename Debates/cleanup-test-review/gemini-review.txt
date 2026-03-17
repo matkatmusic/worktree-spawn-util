@@ -1,0 +1,43 @@
+Loaded cached credentials.
+I will read both `test/cleanup-logic.test.ts` and `Debates/cleanup-test-review/debate-prompt.txt` to understand the instructions.
+Here is a review of `test/cleanup-logic.test.ts` focusing on the criteria provided.
+
+### 1. Effectiveness
+
+**Severity: Low**
+The current tests generally verify their intended purposes effectively. Each test follows a logical flow: setup git state → run heartbeat cycle → verify resulting worktree/branch existence. The assertions match the expectations laid out in the documentation. 
+
+However, one minor issue is that `runHeartbeatCycle` catches and swallows errors from `waitForOutput(daemonProc, "cleanup", 10000)` (lines 368-372). If the daemon crashes or fails to output "cleanup" during this phase, the test silently waits 10 seconds, catches the error, and relies on the subsequent `expect` assertions to fail the test. This makes failing tests unnecessarily slow and obscures the root cause of the failure.
+
+### 2. Coverage Gaps
+
+**Severity: High**
+The tests only cover the "happy path" extreme cases (no changes vs. an untracked file, unmerged commits vs. a `--no-ff` merge). Significant coverage gaps exist for the core business logic of the daemon:
+
+*   **Ignored Directories (`.vscode/`, `.claude/`):** There is no test verifying that changes *strictly* within `.vscode/` or `.claude/` result in a DELETE. This is a stated requirement in the daemon's logic and must be tested.
+*   **Staged but Uncommitted Changes:** Test 2 covers an untracked file. There should be a test verifying that staging a file (but not committing) also correctly results in a PRESERVE.
+*   **Modified Tracked Files:** Test 2 creates a new, untracked file. There should be a test for modifying an already tracked file.
+*   **Fast-Forward Merges:** Test 4 uses `--no-ff` (line 477) to explicitly create a merge commit. The daemon needs to correctly identify and clean up a branch that was fast-forward merged into the parent branch as well.
+*   **Mixed Changes:** A scenario with a committed change + an uncommitted ignored file (e.g., in `.vscode/`), or a merged branch + an uncommitted non-ignored file.
+
+### 3. Test Infrastructure
+
+**Severity: Medium**
+The E2E approach is sound and the helper functions (`loggedGit`, `waitForOutput`) are well-designed for synchronizing with the asynchronous daemon processes. 
+
+*   **Concurrent Test Logging (Lines 29-32 & 186):** Vitest runs tests in parallel by default. Because all tests append to the exact same `LOG_FILE` using `appendFileSync` and stdout listeners, the logs for different tests will likely interleave, making `test/e2e-test.log` very difficult to read when debugging a concurrent test run.
+*   **Timeout Handling (Lines 368-372):** As mentioned in effectiveness, the `try/catch` block for the cleanup wait masks test failures. If the daemon process exits early, `waitForOutput` rejects immediately, but the catch block just logs it and continues.
+*   **Port/Socket Collisions:** The test uses `getSocketPath(repoRoot)`. Since `repoRoot` is a unique temp directory (`mkdtemp`) for each test, Unix socket paths will be isolated, which is a good design choice avoiding collisions.
+*   **Teardown Wait (Line 217):** `await new Promise((r) => setTimeout(r, 500));` after killing the daemon is a magic sleep. It's usually better to listen for the `'exit'` or `'close'` event on the child process to ensure it has truly terminated and released the socket before proceeding.
+
+### 4. Code Quality
+
+**Severity: Nit**
+*   **DRY Violations:** The setup logic for creating a worktree `await git.raw(["worktree", "add", "-b", "test", wtPath]);` and logging its creation is duplicated exactly across all four tests. This could be extracted into a helper function or `beforeEach` block.
+*   **Hardcoded Assertions:** `waitForOutput(daemonProc, "cleanup", 10000)` relies on the string "cleanup" being printed. If the daemon's log messages are refactored, these tests will break or timeout. It might be safer to wait for a specific structured log event or a socket message.
+
+### 5. Risks & Flakiness
+
+**Severity: Medium**
+*   **Git Lock Files:** In `afterEach`, the `git.raw(["worktree", "remove", "--force", p])` runs concurrently or right after a killed daemon process. If the daemon was in the middle of a `git` operation when `SIGTERM` was sent, a `index.lock` or similar git lock file might be left behind, causing the teardown or subsequent cleanup commands to throw errors. 
+*   **File System Delays (Line 374):** The test relies on `await new Promise((r) => setTimeout(r, 1000));` to wait for git operations to complete after the "cleanup" output is detected. Arbitrary sleeps are a classic source of CI flakiness. Slower CI runners might take longer than 1 second to actually delete the worktree directory from disk after the log is emitted. The test should instead poll for the directory/branch deletion up to a timeout, similar to how `waitForSocket` works.

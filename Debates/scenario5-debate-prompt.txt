@@ -1,0 +1,96 @@
+## Debate: Will Scenario 5 (merged worktree cleanup) work correctly?
+
+### Context
+
+A worktree-spawn-util daemon monitors git worktrees. When an IDE window closes, heartbeats stop, and the daemon decides whether to delete the worktree based on its git state.
+
+### Scenario 5: User commits work in worktree, merges it into the parent branch, then closes IDE
+
+Timeline:
+1. User runs pick-repo, selects repo at `/Users/me/myrepo` (currently on `master` at commit `abc123`)
+2. pick-repo captures `parentBranch=master`, `parentCommit=abc123`
+3. Worktree `testv1` is created at `/Users/me/myrepo/.worktrees/testv1` on new branch `testv1`
+4. User makes commits on `testv1` branch inside the worktree IDE window
+5. User switches to the main repo and runs `git merge testv1` on `master`
+6. User closes the worktree IDE window
+7. Heartbeat dies → daemon triggers cleanup after 15s
+
+### Proposed cleanup logic (in order):
+
+```
+Step 1: onlyIgnorableChanges(worktreePath)
+  - git -C /Users/me/myrepo/.worktrees/testv1 status --porcelain
+  - Check if all changed files start with .claude/ or .vscode/
+  - After commit + merge, worktree should be clean (or only have .vscode/tasks.json)
+  - Expected: true → continue
+
+Step 2: hasNewCommits(repoRoot, "testv1", "abc123")
+  - git -C /Users/me/myrepo log abc123..testv1 --oneline
+  - The testv1 branch has commits beyond abc123
+  - Expected: true → continue to merge check
+
+Step 3: isBranchMerged(repoRoot, "testv1", "master")
+  - git -C /Users/me/myrepo branch --merged master
+  - Parse output, check if "testv1" appears in the list
+  - Since master merged testv1, testv1's tip commit IS reachable from master
+  - Expected: true → delete worktree + branch
+```
+
+### Implementation of isBranchMerged:
+
+```typescript
+export async function isBranchMerged(
+  repoRoot: string,
+  branch: string,
+  parentBranch: string,
+): Promise<boolean> {
+  const git = simpleGit(repoRoot);
+  const merged = await git.raw(["branch", "--merged", parentBranch]);
+  const mergedBranches = merged.split("\n").map(l => l.replace(/^\*?\s+/, "").trim());
+  return mergedBranches.includes(branch);
+}
+```
+
+### Implementation of hasNewCommits:
+
+```typescript
+export async function hasNewCommits(
+  repoRoot: string,
+  branch: string,
+  parentCommit: string,
+): Promise<boolean> {
+  const git = simpleGit(repoRoot);
+  const log = await git.raw(["log", `${parentCommit}..${branch}`, "--oneline"]);
+  return log.trim().length > 0;
+}
+```
+
+### Implementation of onlyIgnorableChanges:
+
+```typescript
+export async function onlyIgnorableChanges(worktreePath: string): Promise<boolean> {
+  const git = simpleGit(worktreePath);
+  const status = await git.raw(["status", "--porcelain"]);
+  const lines = status.trim().split("\n").filter((l) => l.trim().length > 0);
+  if (lines.length === 0) return true;
+  return lines.every((line) => {
+    const filePath = line.slice(3).split(" -> ")[0];
+    return filePath.startsWith(".claude/") || filePath.startsWith(".vscode/");
+  });
+}
+```
+
+### Your Task
+
+1. Will `git branch --merged master` correctly include `testv1` after `git merge testv1` was run on master?
+2. Will `git log abc123..testv1 --oneline` still show commits after the merge? (The testv1 branch tip hasn't moved — only master moved forward)
+3. Are there edge cases where this would fail?
+   - Fast-forward merge vs merge commit
+   - Squash merge
+   - Rebase merge
+   - The worktree checkout state after merge (is the worktree's working tree affected by the merge on master?)
+4. Will `git worktree remove --force testv1` work while the worktree's branch is checked out in the worktree?
+5. Will `git branch -d testv1` work after the worktree is removed?
+6. What happens if `simpleGit(repoRoot)` runs git commands while the worktree still exists vs after it's removed?
+
+Provide your analysis with specific git behavior references.

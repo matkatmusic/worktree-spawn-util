@@ -1,0 +1,254 @@
+Synthesis: cleanup-logic.test.ts Review
+========================================
+Reviewers: Gemini, Codex, Sonnet, Opus
+Date: 2026-03-16
+
+Legend: [G]=Gemini [C]=Codex [S]=Sonnet [O]=Opus
+Consensus strength: 4/4 = unanimous, 3/4 = strong, 2/4 = moderate, 1/4 = solo
+
+================================================================================
+CRITICAL — Must fix before merging
+================================================================================
+
+1. No test for ignorable-only changes (.claude/ or .vscode/)
+   Flagged by: [G] [C] [S] [O] — unanimous
+   The onlyIgnorableChanges() function is the gatekeeper for the entire cleanup
+   decision tree. Zero test coverage for the "only .claude/ changes present"
+   path means a regression (e.g., a prefix check matching ".clauderc") would be
+   invisible.
+   FIX: Add a test that writes a file at .claude/settings.json inside the
+   worktree, then verify the daemon DELETES (treats changes as ignorable).
+
+2. waitForOutput() can miss patterns split across chunks
+   Flagged by: [S] [O] — moderate (but both infrastructure-focused reviewers)
+   stdout chunks are not guaranteed to align to message boundaries. If
+   "cleanup" arrives as "cle"+"anup" in two chunks, includes() on each chunk
+   individually will never match. Unlikely with short messages but non-zero.
+   FIX: Buffer all stdout into a growing string and re-check the full buffer
+   on each data event, instead of checking each chunk in isolation.
+
+================================================================================
+HIGH — Should fix
+================================================================================
+
+3. No test for mixed changes (ignorable + non-ignorable)
+   Flagged by: [G] [S] [O] — strong consensus
+   A worktree with both .claude/ changes AND a real user file should PRESERVE.
+   The every() logic handles this, but no test proves it.
+   FIX: Add a test with .claude/foo + real-file.txt, assert PRESERVE.
+
+4. No test for staged-but-not-committed changes
+   Flagged by: [G] [S] [O] — strong consensus
+   Test 2 only covers untracked files. A git-added-but-not-committed file has
+   a different status --porcelain code ("A " vs "??"). The parsing should
+   handle it, but there is no proof.
+   FIX: Add a test that stages a file with git add, assert PRESERVE.
+
+5. afterEach uses magic sleep instead of waiting for process exit
+   Flagged by: [G] [S] [O] — strong consensus
+   Line 217: 500ms setTimeout after killing daemon. On slow CI, daemon may not
+   release socket in time, causing the next test to encounter a stale socket.
+   FIX: Replace with `await new Promise(r => daemonProc.on('exit', r))`.
+
+6. Tests run against stale dist/ if not rebuilt
+   Flagged by: [C] [S] [O] — strong consensus
+   Lines 22-23 reference dist/cli/daemon.js and dist/cli/heartbeat.js. No
+   freshness guard. Vitest does not rebuild before running.
+   FIX: Either add a beforeAll that runs `npm run build`, use tsx to run
+   TypeScript source directly, or add a vitest globalSetup that builds first.
+
+7. waitForOutput "cleanup" rejection is silently swallowed
+   Flagged by: [G] [S] [O] — strong consensus
+   Lines 350-355: try/catch around waitForOutput(daemonProc, "cleanup", 10000)
+   logs the error but does not fail the test. If cleanup never triggers, test
+   silently proceeds to assertions which may be non-deterministic.
+   FIX: Remove the try/catch, or re-throw the error so the test fails loudly
+   with a clear "cleanup never triggered" message.
+
+8. Replace 1s sleep after cleanup detection with deterministic wait
+   Flagged by: [G] [O] — moderate
+   Line 374: arbitrary 1000ms sleep waiting for git operations to complete.
+   Classic CI flakiness source.
+   FIX: Wait for the daemon's final decision message ("Removed worktree and
+   branch" or "preserving" or "uncommitted changes") instead of sleeping.
+   Alternatively, poll for directory/branch deletion up to a timeout.
+
+================================================================================
+MEDIUM — Should fix when touching this code
+================================================================================
+
+9. Missing negative assertions on DELETE tests
+   Flagged by: [O] — solo, but well-reasoned
+   Tests 1 and 4 assert the worktree was deleted but do NOT assert the daemon
+   did not log "preserving" or "uncommitted changes". A bug where the daemon
+   first logs "preserving" then deletes anyway would pass.
+   FIX: Add expect(output).not.toContain("preserving") to DELETE tests.
+
+10. Weak "merged" substring match in Test 4
+    Flagged by: [O] — solo, but clearly correct
+    Line 497: expect(output).toContain("merged") would also match "unmerged
+    commits" (the opposite case). A bug printing "unmerged" would pass.
+    FIX: Use expect(output).toContain('is merged into') to match the actual
+    daemon log message exactly.
+
+11. waitForOutput leaks listeners
+    Flagged by: [S] [O] — moderate
+    Each call registers a data listener that is never removed. After resolution,
+    old listeners remain attached with stale closures. Not a correctness bug
+    in current usage but will cause node warnings if many calls are made.
+    FIX: Return a cleanup function or remove the listener after resolve/reject.
+
+12. Fast-forward merge path not tested
+    Flagged by: [G] [S] — moderate
+    Test 4 uses --no-ff. A FF merge leaves the branch tip as a direct ancestor.
+    git branch --merged handles this, but without a test there is no proof.
+    FIX: Add a test that merges without --no-ff, assert DELETE.
+
+13. Multiple commits on branch not tested
+    Flagged by: [S] — solo
+    All tests use at most one commit. Real worktrees will have multiple.
+    FIX: Add a test with 2+ commits, verify merge detection still works.
+
+14. No test for "no parent info" legacy fallback path
+    Flagged by: [S] [O] — moderate
+    daemon-server.ts lines 97-109 have a fallback when parentBranch/parentCommit
+    are missing. No test coverage for this safety-critical path.
+    FIX: Register a worktree without parent info, verify cleanup still works.
+
+15. Timing dependency on heartbeat seq number "#3"
+    Flagged by: [S] — solo (Sonnet rated Critical, but others did not flag)
+    Line 340: waitForOutput for "Received heartbeat #3" is brittle if the
+    numbering scheme changes. Works today but has no compile-time safety.
+    FIX: Wait for a count-agnostic pattern like "Received heartbeat" appearing
+    3 times, or extract the magic number into a constant.
+
+16. "cleanup" substring match is fragile
+    Flagged by: [G] [O] — moderate
+    waitForOutput waits for "cleanup" but the actual message is "evaluating
+    cleanup". If wording changes to "clean-up" this breaks silently.
+    FIX: Use the more specific pattern "evaluating cleanup".
+
+17. Fixed 200ms sleep after register (line 378)
+    Flagged by: [S] — solo
+    Heuristic timing; could fail on slow systems.
+    FIX: Wait for a daemon acknowledgment message instead.
+
+18. Git lock file risk in afterEach
+    Flagged by: [G] — solo
+    If daemon was mid-git-operation when killed, index.lock could be left
+    behind, causing teardown to throw.
+    FIX: Add a retry or delete index.lock before git worktree remove.
+
+================================================================================
+LOW — Nice to have
+================================================================================
+
+19. beforeAll imported but unused (line 7)
+    Flagged by: [S] [O] — moderate
+    FIX: Remove the unused import.
+
+20. LOG_FILE grows unbounded across CI runs
+    Flagged by: [S] — solo
+    test/e2e-test.log persists and accumulates without clear run boundaries.
+    FIX: Truncate at start of each test run (beforeAll) or use a temp file.
+
+21. loggedGit only wraps git.raw(), not add()/commit()
+    Flagged by: [S] [O] — moderate
+    Setup operations via git.add() and git.commit() are not captured in logs.
+    FIX: Wrap additional methods or use a Proxy-based approach.
+
+22. Use unique worktree names per test
+    Flagged by: [O] — solo
+    All tests use "test" as the branch name. Unique names like "test-nochange",
+    "test-uncommitted" would make logs self-documenting.
+    FIX: Use descriptive unique names per test.
+
+23. Error path in cleanup has no test
+    Flagged by: [O] — solo
+    daemon-server.ts lines 148-153 catch errors and preserve the worktree.
+    This data-loss-prevention path has zero coverage.
+    FIX: Corrupt a worktree path before daemon evaluates it, verify PRESERVE.
+
+24. Tests depend on system git config (user identity)
+    Flagged by: [S] — solo
+    git commit requires user.name/user.email. Tests should set local config.
+    FIX: Add git config user.name/email in beforeEach.
+
+================================================================================
+NIT — Cleanup when convenient
+================================================================================
+
+25. DRY: Duplicate worktree creation boilerplate across all 4 tests
+    Flagged by: [G] [S] [O] — strong consensus
+    FIX: Extract into createTestWorktree(git, repoRoot, name) helper.
+
+26. DRY: Duplicate verification block (dirExists + branchExists + assertions)
+    Flagged by: [O] — solo
+    FIX: Extract assertWorktreeDeleted() / assertWorktreePreserved() helpers.
+
+27. runHeartbeatCycle name is too generic
+    Flagged by: [S] — solo
+    FIX: Rename to spawnDaemonAndSimulateIDEClose or runFullCleanupScenario.
+
+28. commitHash captured but never used (tests 3 and 4)
+    Flagged by: [S] — solo
+    FIX: Either assert against commitHash or remove the variable.
+
+29. Verbose PURPOSE/INTENT comments on obvious code
+    Flagged by: [S] — solo
+    FIX: Remove comments on self-explanatory one-liners; keep on non-obvious
+    decisions only.
+
+================================================================================
+DISAGREEMENTS
+================================================================================
+
+A. Socket path collision risk
+   Sonnet flagged [High] that getSocketPath() could theoretically hash two
+   different tempdir paths to the same value. Codex, Gemini, and Opus all noted
+   that per-test temp dirs make socket isolation sound. Gemini explicitly called
+   it "a good design choice." VERDICT: Low risk. Verify getSocketPath uses the
+   full path, not a truncated hash. No test needed unless hash collisions are
+   plausible.
+
+B. Heartbeat seq "#3" timing dependency severity
+   Sonnet rated this Critical. No other reviewer flagged it at all. The pattern
+   works reliably because heartbeats are sequential and chunks containing "#3"
+   will always include the substring. VERDICT: Medium at most. Worth making
+   more robust, but not blocking.
+
+C. afterEach correctness for heartbeat cleanup
+   Opus initially flagged heartbeatProc being set to null before process exit
+   as potentially dangerous, then self-corrected after re-reading the code:
+   afterEach correctly handles the error path because heartbeatProc is only
+   nulled after kill(). VERDICT: No bug. Current code is correct.
+
+D. Overall test quality assessment
+   All four reviewers agree the E2E approach is sound and the four core
+   scenarios are correctly tested. The disagreement is on severity of gaps:
+   Gemini and Codex are more lenient (tests are "reasonable"), while Sonnet
+   and Opus identify more granular issues. All agree the ignorable-changes
+   gap is the highest-priority missing test.
+
+================================================================================
+RECOMMENDED FIX ORDER
+================================================================================
+
+Phase 1 — Before merge (Critical + High):
+  1. Add ignorable-only changes test (#1)
+  2. Add mixed changes test (#3)
+  3. Add staged-but-not-committed test (#4)
+  4. Buffer waitForOutput to handle chunk splits (#2)
+  5. Replace magic sleeps with event-based waits (#5, #8)
+  6. Make swallowed cleanup error fail loudly (#7)
+  7. Add dist/ freshness guard (#6)
+
+Phase 2 — Next iteration (Medium):
+  8. Add negative assertions (#9)
+  9. Fix weak "merged" match (#10)
+  10. Add FF merge test (#12)
+  11. Clean up waitForOutput listeners (#11)
+  12. Add "no parent info" fallback test (#14)
+
+Phase 3 — Polish (Low + Nit):
+  13. Remove unused import, fix log file, DRY helpers (#19-29)
