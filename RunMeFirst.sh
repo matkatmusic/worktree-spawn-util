@@ -60,6 +60,16 @@ echo ""
 echo "Running npm install..."
 npm install
 
-# 4. Success
+# 4. Build the project
+echo ""
+echo "Building project..."
+npm run build
+
+# 5. Install VS Code task into parent repo (if submodule)
+echo ""
+echo "Checking if installed as submodule..."
+node dist/cli/install-parent-task.js
+
+# 6. Success
 echo ""
 echo "Setup complete! You can now use the VS Code tasks."

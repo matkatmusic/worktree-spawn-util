@@ -7,7 +7,7 @@ import { createConnection } from "node:net";
 import { fileURLToPath } from "node:url";
 import * as readline from "node:readline/promises";
 import { promisify } from "node:util";
-import { validateRepo, createWorktree } from "../git.js";
+import { validateRepo, createWorktree, getSuperprojectRoot } from "../git.js";
 import { detectIde, launchIde, writeWorktreeTasksFile } from "../ide.js";
 import { getSocketPath, ensureSocketDir, isSocketAlive, getDaemonSessionName } from "../socket.js";
 import { Logger } from "../logger.js";
@@ -48,6 +48,7 @@ async function pickFolder(): Promise<string | null> {
 // --- Parse args ---
 const cliArgs = process.argv.slice(2);
 const visible = cliArgs.includes("--inspectHB");
+const forcePick = cliArgs.includes("--pick");
 const rawName = cliArgs.find((a) => !a.startsWith("--")) ?? "";
 
 if (!rawName.trim()) {
@@ -66,8 +67,20 @@ if (worktreeName !== rawName.trim()) {
   logger.log(`[pick-repo] Sanitized name: "${rawName.trim()}" -> "${worktreeName}"`);
 }
 
-// --- Repo picker ---
-const folder = await pickFolder();
+// --- Repo picker (auto-detect submodule parent or prompt) ---
+let folder: string | null = null;
+
+if (!forcePick) {
+  const superproject = await getSuperprojectRoot(__dirname);
+  if (superproject) {
+    folder = superproject;
+    logger.log(`[pick-repo] Auto-detected parent repo (submodule): ${folder}`);
+  }
+}
+
+if (!folder) {
+  folder = await pickFolder();
+}
 
 if (!folder) {
   logger.error("[pick-repo] No folder selected.");

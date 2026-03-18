@@ -2,8 +2,14 @@
 
 import { simpleGit } from "simple-git";
 import { join } from "node:path";
+import { execFile } from "node:child_process";
 import { access, mkdir } from "node:fs/promises";
+import { promisify } from "node:util";
 import type { Logger } from "./logger.js";
+
+const execFileAsync = promisify(execFile);
+
+const IGNORABLE_PREFIXES = [".claude/", ".vscode/"];
 
 export type WorktreeInfo = {
   path: string;
@@ -15,6 +21,21 @@ export type RepoSelection = {
   repoRoot: string;
   isValid: boolean;
 };
+
+/**
+ * Detect if `cwd` is inside a git submodule and return the superproject root.
+ * Returns null if not a submodule or not in a git repo at all.
+ */
+export async function getSuperprojectRoot(cwd: string): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync("git", [
+      "-C", cwd, "rev-parse", "--show-superproject-working-tree",
+    ]);
+    return stdout.trim() || null;
+  } catch {
+    return null;
+  }
+}
 
 /** Validate that a folder is a git repo and resolve to its root. */
 export async function validateRepo(folderPath: string, logger?: Logger): Promise<RepoSelection> {
@@ -100,11 +121,11 @@ export async function createWorktree(
     );
   }
 
-  // Ensure .worktrees directory exists
-  await mkdir(join(repoRoot, ".worktrees"), { recursive: true });
-
-  // Create worktree — reuse existing branch or create new one
-  const branches = await git.branchLocal();
+  // Ensure .worktrees directory exists + check branches concurrently
+  const [branches] = await Promise.all([
+    git.branchLocal(),
+    mkdir(join(repoRoot, ".worktrees"), { recursive: true }),
+  ]);
   if (branches.all.includes(worktreeName)) {
     logger?.log("[git] createWorktree: reusing existing branch " + worktreeName);
     await git.raw(["worktree", "add", worktreePath, worktreeName]);
@@ -163,7 +184,7 @@ export async function onlyIgnorableChanges(worktreePath: string, logger?: Logger
   const result = lines.every((line) => {
     // status --porcelain format: XY <path> or XY <path> -> <path>
     const filePath = line.slice(3).split(" -> ")[0];
-    return filePath.startsWith(".claude/") || filePath.startsWith(".vscode/");
+    return IGNORABLE_PREFIXES.some((p) => filePath.startsWith(p));
   });
   logger?.log("[git] onlyIgnorableChanges: ignorable=" + result + " (" + lines.length + " files)");
   return result;
