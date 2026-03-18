@@ -1,0 +1,111 @@
+Build a Node.js/TypeScript CLI toolkit that automates the full lifecycle of git worktrees for a multi-agent code review workflow. Use test-driven development throughout: write failing tests before any implementation code, make them pass with the minimum implementation, then refactor. Every behavior described below must have corresponding test coverage. Use Vitest as the test framework. The project uses ESM modules exclusively (no CommonJS), TypeScript compiled with tsc (no bundler), and has a single runtime dependency: simple-git for git operations.
+
+WHAT THIS TOOL DOES
+
+A developer provides a worktree name. The tool creates a git worktree, launches an IDE pointed at it, starts a Claude Code agent in a tmux session alongside a terminal, and wires up background monitoring. When the IDE window closes, the system evaluates the worktree's state and either cleans it up automatically or preserves it and notifies the developer. The entire flow is one command.
+
+CORE CAPABILITIES
+
+1. Worktree Management
+
+Create git worktrees inside a designated subdirectory of the repository root. Worktree creation must be idempotent: if a worktree already exists with the same path and branch, return it without modification. Detect and reject conflicts: if the requested branch is already checked out in a different worktree, or if the target directory exists but is not a known worktree, report an error. When creating, reuse an existing local branch if one matches the name; otherwise create a new branch. Support force-removing a worktree and deleting its branch, but branch deletion failures must be logged and not cause the operation to fail.
+
+Provide the ability to check whether a branch is fully merged into another branch, whether a branch has new commits beyond a given commit hash, and whether all uncommitted changes in a worktree are limited to tool-generated paths (specifically .claude/ and .vscode/ directories).
+
+Sanitize user-provided worktree names to be valid git ref names before use.
+
+Parse the porcelain output of git's worktree list command into structured data.
+
+2. Submodule Detection
+
+Detect whether the tool is installed as a git submodule inside a parent repository. When running as a submodule, automatically use the parent repository as the target for worktree operations instead of prompting the user.
+
+Provide a setup mechanism (invoked during first-time installation) that detects the submodule situation and injects IDE task definitions into the parent repository's configuration. This injection must be idempotent: if the tasks already exist, skip without modification. The injected tasks must include a build step for the tool itself and a task that runs the main worktree orchestrator, with the build step as a dependency. Paths in the injected tasks must be relative to the parent repository root using IDE path variables.
+
+3. Background Daemon
+
+A long-running daemon process monitors active worktrees for a single repository. It communicates over Unix domain sockets using newline-delimited JSON messages. The daemon accepts two kinds of messages: registration (which records the worktree name and its parent branch/commit context) and heartbeats (which update a last-seen timestamp).
+
+The daemon runs a periodic check. When a worktree's heartbeat has not been received within a configurable timeout, the daemon triggers cleanup evaluation. The daemon self-terminates after a configurable idle period with no registered worktrees. On shutdown, it cleans up its socket file.
+
+Socket paths must be deterministic for a given repository (so that multiple processes can independently compute the path to the same daemon). There must be a mechanism to detect and clean up stale sockets left by crashed daemons.
+
+Only one daemon may run per repository. Daemon startup must check for an existing live daemon and exit cleanly if one is found.
+
+4. Heartbeat System
+
+A separate long-running process sends periodic heartbeat messages to the daemon over the Unix socket. This process is designed to run as an IDE background task that starts when the IDE window opens and is killed when the IDE window closes. The absence of heartbeats is how the daemon detects that an IDE window has been closed.
+
+Heartbeat sending must handle connection failures gracefully (the daemon may not be running yet, or may have restarted). Failed heartbeats are logged but never crash the process.
+
+5. Conditional Cleanup
+
+When the daemon detects a heartbeat timeout for a worktree, it performs cleanup evaluation in this exact order:
+
+First, kill any terminal multiplexer session associated with the worktree.
+
+Then evaluate the worktree's git state:
+- If no parent branch/commit context was registered: force-delete the worktree and branch.
+- If there are uncommitted changes outside of tool-generated directories (.claude/, .vscode/): preserve the worktree and notify the user.
+- If there are no new commits beyond the parent commit: delete the worktree and branch.
+- If there are new commits and the branch is fully merged into the parent branch: delete the worktree and branch.
+- If there are new commits and the branch is NOT merged: preserve the worktree and notify the user.
+- If any error occurs during evaluation: preserve the worktree as a safe default.
+
+This decision tree must be followed in exactly this order. The safe default on any error is always to preserve.
+
+6. IDE Integration
+
+Detect which IDE launched the process. macOS is the primary platform; use platform-native mechanisms for detection. The design should isolate platform-specific code behind an abstraction so that Linux and Windows support can be added later without restructuring. Support VS Code, VS Code Insiders, and Cursor/AGY as detection targets.
+
+Launch the detected IDE as a detached process pointed at a worktree path.
+
+Write IDE task configuration files into worktrees. These tasks run on folder open and include: a heartbeat sender task (hidden by default, optionally visible for debugging), a terminal multiplexer attach task, and optionally a daemon monitor task. Task writing must be idempotent: check for existing tasks by label before adding, and report whether the file was created, updated, or unchanged.
+
+Provide the ability to reload an IDE window programmatically and to send native system notifications. Both are best-effort operations that must never throw errors.
+
+7. Orchestrator CLI
+
+The main user-facing command ties everything together in sequence:
+- Accept a worktree name and optional flags for debug visibility and forcing the folder picker
+- Detect the repository (auto-detect submodule parent, or show a native folder picker)
+- Validate that the selected folder is a git repository
+- Record the current branch and HEAD commit for later cleanup context
+- Create the worktree
+- Ensure the daemon is running (start it in a tmux session if not, with a fallback to a detached process if tmux is unavailable; poll for readiness)
+- Register the worktree with the daemon, providing parent branch and commit context
+- Create a tmux session for the worktree with Claude Code in one pane and a terminal in another; rename the Claude conversation to match the worktree name
+- Write IDE task configuration into the worktree
+- Launch the IDE
+- Offer to add the worktrees directory to .gitignore
+
+8. Logging
+
+All modules that perform I/O should accept an optional logger. The logger supports log, warn, and error levels, writes to both console and an optional file, and prefixes each file entry with an ISO timestamp and level tag. Console output can be suppressed via a silent mode. File write failures must be swallowed silently.
+
+9. First-Time Setup Script
+
+A shell script that checks for prerequisites (Node.js, tmux), installs them if the user consents, runs dependency installation, builds the project, and invokes the submodule task installer.
+
+CROSS-CUTTING CONSTRAINTS
+
+Idempotency: every operation that creates or modifies state must be safe to run multiple times. This includes worktree creation, task file writing, parent task injection, and daemon startup.
+
+Error philosophy: preserve user work on any error. Socket failures log but never crash. Notifications, file logging, and branch deletion are best-effort. The daemon ignores malformed messages.
+
+Platform strategy: macOS is the primary target. All platform-specific functionality (folder picker, IDE detection, system notifications, IDE reload) must be isolated behind abstractions so that alternative implementations for Linux and Windows can be added without changing the core logic.
+
+The project should expose a barrel export that re-exports all public API surface from its internal modules, so it can be consumed as a library in addition to being used as a CLI.
+
+TEST STRATEGY
+
+Use TDD for every module. Build from the bottom up: start with modules that have no internal dependencies and work up to the orchestrator. Each module's tests must cover:
+
+- Happy path behavior
+- Idempotency (calling the same operation twice produces the same result)
+- Error handling (graceful behavior on failures)
+- Edge cases specific to the module (conflict detection for worktrees, malformed messages for the daemon, missing environment variables for IDE detection)
+
+For git operations, use real temporary git repositories in tests rather than mocks. For socket operations, use real Unix sockets. For cleanup logic, test every branch of the decision tree independently, including the error-preserves-worktree safe default.
+
+Include a smoke test that imports the barrel export and verifies all public symbols are defined.

@@ -1,0 +1,203 @@
+Build a complete Node.js/TypeScript CLI toolkit called "worktree-spawn-util" from scratch. Use test-driven development (TDD) throughout: for every module, write failing tests first, then implement until tests pass, then refactor. Do not write any implementation code without a corresponding test already in place. Use Vitest as the test framework.
+
+PROJECT SETUP
+
+Initialize a Node.js project with these exact settings:
+- name: "worktree-spawn-util", version: "0.1.0"
+- "type": "module" (ESM throughout, no CommonJS)
+- TypeScript compiled with tsc (no bundler), strict mode, target ES2022, module NodeNext, moduleResolution NodeNext, incremental builds, rootDir "src", outDir "dist", declaration true, esModuleInterop true, skipLibCheck true, forceConsistentCasingInFileNames true
+- include: ["src"], exclude: ["node_modules", "dist"]
+- Runtime dependency: simple-git ^3.27.0
+- Dev dependencies: typescript ^5.8.2, @types/node ^22.13.10, vitest ^3.0.9
+- Scripts: "build": "tsc", "dev": "tsc --watch", "test": "vitest run", "test:watch": "vitest"
+- Bin entries: "wt-pick-repo": "dist/cli/pick-repo.js", "wt-daemon": "dist/cli/daemon.js", "wt-heartbeat": "dist/cli/heartbeat.js"
+- main: "dist/index.js", types: "dist/index.d.ts"
+
+Every source file uses ESM imports with ".js" extensions in import paths (TypeScript ESM convention). Every CLI entry point starts with #!/usr/bin/env node.
+
+TDD PROCESS
+
+For each module below, follow this exact cycle:
+1. Write the test file first with all test cases described. Tests must fail initially (red).
+2. Write the minimum implementation to make tests pass (green).
+3. Refactor if needed while keeping tests green.
+4. Move to the next module only after all tests pass.
+
+Build modules in this order, because later modules depend on earlier ones:
+1. logger (no dependencies)
+2. config (no dependencies, types only)
+3. process (no dependencies, types only)
+4. socket (depends on node built-ins only)
+5. git (depends on simple-git, logger)
+6. daemon-client (depends on logger)
+7. ide (depends on socket, logger)
+8. daemon-server (depends on git, ide, logger)
+9. CLI entry points: daemon, heartbeat, pick-repo, install-parent-task
+10. Barrel export: index.ts
+11. RunMeFirst.sh setup script
+12. Smoke test for barrel export
+
+MODULE 1: LOGGER (src/logger.ts, test/logger.test.ts)
+
+Export a Logger class. Constructor takes optional filePath (string) and optional options object with a silent boolean field. Three methods: log(message), warn(message), error(message). Each method writes to console.log/console.warn/console.error respectively (unless silent is true) AND appends to the file (if filePath was provided). File format: "[ISO-timestamp] [LOG] message\n" (or [WARN] or [ERROR]). File write is async via fs/promises appendFile. File write errors must be swallowed silently with .catch(() => {}). The writeToFile method is private.
+
+Tests: log/warn/error write to console with correct method; silent mode suppresses console; file output contains correct prefix and message; file write errors do not throw; missing filePath means no file writes.
+
+MODULE 2: CONFIG (src/config.ts)
+
+Export a type SpawnConfig with fields: ideCommand (string), pollIntervalMs (number). This is a type-only file, no runtime code.
+
+MODULE 3: PROCESS (src/process.ts)
+
+Export a type ProcessHandle with field: pid (number). Stub only, no implementation logic. The heartbeat system serves as the actual monitoring mechanism.
+
+MODULE 4: SOCKET (src/socket.ts, test/socket.test.ts)
+
+Imports: node:crypto, node:fs, node:fs/promises, node:path, node:net.
+
+Constant: SOCKET_DIR_PREFIX = "wtsu".
+
+Export function getSocketDir(): returns "/tmp/wtsu-<uid>/" where uid comes from process.getuid() (default to 0 if unavailable).
+
+Export function ensureSocketDir(): creates the socket directory with mkdirSync mode 0o700. If the path exists but is not a directory, throw an error. Returns the directory path.
+
+Export async function getSocketPath(repoRoot: string): resolves repoRoot to its real path via fs/promises realpath, computes SHA-256 hash, truncates to 12 hex characters, returns "<socketDir>/<hash>.sock".
+
+Export async function getDaemonSessionName(repoRoot: string): same hash as getSocketPath, returns "wtsu_daemon_<hash>".
+
+Export async function isSocketAlive(socketPath: string): attempts a net.createConnection to the Unix socket path with a 2-second timeout. Returns true if connection succeeds, false on any error. Always destroys the socket after checking.
+
+Export async function cleanStaleSocket(socketPath: string): checks if daemon is alive via isSocketAlive. If alive, return false (not safe to start new daemon). If not alive, remove the socket file with fs.unlinkSync (ignore ENOENT), return true.
+
+Tests: getSocketDir returns correct format with uid; getSocketPath is deterministic (same input gives same output); getSocketPath produces different results for different inputs; getDaemonSessionName uses same hash but different prefix; ensureSocketDir creates directory with correct permissions; isSocketAlive returns false for nonexistent socket; cleanStaleSocket removes stale file.
+
+MODULE 5: GIT (src/git.ts, test/git.test.ts)
+
+Imports: simple-git (simpleGit), node:path (join), node:child_process (execFile), node:fs/promises (access, mkdir), node:util (promisify), logger.
+
+Create promisified execFileAsync from execFile.
+
+Constant: IGNORABLE_PREFIXES = [".claude/", ".vscode/"].
+
+Export type WorktreeInfo: { path: string, branch: string }.
+Export type RepoSelection: { repoRoot: string, isValid: boolean }.
+
+Export async function getSuperprojectRoot(cwd: string): runs "git -C <cwd> rev-parse --show-superproject-working-tree". Returns trimmed stdout or null. On any error, return null.
+
+Export async function validateRepo(folderPath: string, logger?): uses simpleGit(folderPath).checkIsRepo(). If true, gets root via revparse(["--show-toplevel"]).trim(). Returns { repoRoot, isValid }.
+
+Export function parseWorktreeList(raw: string, logger?): splits on double newlines, filters empty blocks, extracts "worktree " and "branch refs/heads/" lines from each block. Returns WorktreeInfo[].
+
+Export async function createWorktree(repoRoot, worktreeName, logger?): creates worktree at join(repoRoot, ".worktrees", worktreeName). First lists existing worktrees. If exact match (path AND branch), return it (idempotent). If branch exists in a different worktree, throw Error with message including the conflicting path. Check if directory exists on disk via access(); if it exists but is not a known worktree, throw Error. Concurrently: ensure .worktrees directory exists (mkdir recursive) AND get local branches. If branch exists in branches, use "git worktree add <path> <name>". Otherwise use "git worktree add -b <name> <path>". Return { path, branch }.
+
+Export async function isBranchMerged(repoRoot, branch, parentBranch, logger?): runs "git branch --merged <parentBranch>". Parses output, stripping leading "* ", "+ ", or whitespace prefixes. Returns true if branch is in the list.
+
+Export async function hasNewCommits(repoRoot, branch, parentCommit, logger?): runs "git log <parentCommit>..<branch> --oneline". Returns true if output is non-empty.
+
+Export async function onlyIgnorableChanges(worktreePath, logger?): runs "git status --porcelain" in the worktree. If no output, return true. For each line, extract the file path from column 3 onward (split on " -> " for renames, take first part). Return true only if every file path starts with one of the IGNORABLE_PREFIXES.
+
+Export async function removeWorktreeAndBranch(repoRoot, worktreeName, logger?): runs "git worktree remove --force <worktreeName>", then "git branch -D <worktreeName>". Branch deletion failure is caught, logged via logger.error, but not rethrown.
+
+Tests: use real git repos in temp directories. parseWorktreeList correctly parses porcelain output; createWorktree creates a worktree and returns correct info; createWorktree is idempotent on second call; createWorktree throws on branch conflict; createWorktree throws on directory conflict; isBranchMerged returns true for merged branch; isBranchMerged returns false for unmerged; hasNewCommits detects new commits; hasNewCommits returns false when none; onlyIgnorableChanges returns true for .claude/ and .vscode/ changes; onlyIgnorableChanges returns false for other changes; removeWorktreeAndBranch removes both.
+
+MODULE 6: DAEMON-CLIENT (src/daemon-client.ts, test/heartbeat.test.ts)
+
+Module-level state: let heartbeatCount = 0 (incremented per send).
+
+Export function parseArgs(args: string[]): extracts --repo-root and --worktree values from args array. Returns { repoRoot, worktree }.
+
+Export function sendHeartbeat(socketPath, worktreeName, logger?): increments heartbeatCount. Creates a net.createConnection to the Unix socket. On connect, writes JSON line: { type: "heartbeat", worktree: worktreeName, seq: heartbeatCount } followed by newline, then ends connection. On error (ENOENT, ECONNREFUSED, or other), log warning but do not throw. Set a 3-second timeout on the socket; on timeout, destroy it.
+
+Tests: parseArgs extracts correct values; sendHeartbeat does not throw when socket does not exist.
+
+MODULE 7: IDE (src/ide.ts, test/ide.test.ts)
+
+Imports: node:child_process (execFile, spawn), node:fs/promises (readFile, writeFile, mkdir), node:path (dirname, join), node:url (fileURLToPath), node:util (promisify), socket.ts (getDaemonSessionName), logger.
+
+Compute __filename and __dirname from import.meta.url using fileURLToPath.
+
+Constant IDE_BUNDLE_MAP: { "com.microsoft.VSCode": "code", "com.microsoft.VSCodeInsiders": "code-insiders", "com.google.antigravity": "agy" }.
+
+Export type IdeConfig: { command: string }.
+Export type TasksFileStatus: "created" | "updated" | "unchanged".
+
+Internal type Task: { label, type, command, runOptions: { runOn }, presentation: { reveal, panel, group, focus }, isBackground, problemMatcher }.
+Internal type TasksJsonFile: { version: string, tasks: Task[] }.
+
+Export function detectIde(): checks process.env.__CFBundleIdentifier against IDE_BUNDLE_MAP first. Fallback: checks process.env.VSCODE_GIT_ASKPASS_NODE for substrings "Visual Studio Code Insiders", "Visual Studio Code", "Antigravity" (in that order). Returns IdeConfig or null.
+
+Export function launchIde(config, worktreePath, logger?): spawns config.command with [worktreePath], detached true, stdio "ignore". Unrefs the child.
+
+Internal function addWorktreeSessionTask(existing, worktreeName, logger?): checks if task with label "Worktree: <name>" exists. If so, return tasks unchanged. Otherwise push task: type shell, command "tmux attach -t <worktreeName>", runOptions.runOn "folderOpen", presentation reveal always/panel dedicated/group "worktree-<name>"/focus true, isBackground true, problemMatcher [].
+
+Internal function addHeartbeatTask(existing, worktreeName, repoRoot, visible?, logger?): checks label "Heartbeat: <name>". Pushes task: type shell, command is "node <__dirname>/cli/heartbeat.js --repo-root <repoRoot> --worktree <worktreeName>", runOptions.runOn "folderOpen". Presentation: if visible, reveal always/panel dedicated/group "daemon-<name>"/focus false; if not visible, reveal never/panel shared/group "heartbeat-<name>"/focus false. isBackground true, problemMatcher [].
+
+Internal function addDaemonMonitorTask(existing, worktreeName, sessionName, logger?): label "Daemon Monitor". Command: "tmux attach -t <sessionName>". Only added when visible mode is on. Same folderOpen/dedicated pattern, focus false.
+
+Internal function writeUpdatedTasks(tasksJson, tasksPath, logger?): writes JSON.stringify(tasksJson, null, 2) + "\n" to the file.
+
+Export async function writeWorktreeTasksFile(worktreePath, worktreeName, repoRoot?, visible?, logger?): computes tasksPath as join(worktreePath, ".vscode", "tasks.json"). If visible and repoRoot, get sessionName via getDaemonSessionName. Try to read existing file and JSON.parse it. If exists: add heartbeat task (if repoRoot), add worktree session task, optionally add daemon monitor task. If task count unchanged, return "unchanged". Otherwise write and return "updated". If no existing file: create skeleton { version: "2.0.0", tasks: [] }, add same tasks, mkdir .vscode, write, return "created".
+
+Export async function reloadIdeWindow(bundleId, logger?): runs osascript with AppleScript that activates the app by bundle ID, then uses System Events to keystroke Cmd+Shift+P, type "Reload Window", press Enter (key code 36). On error, log fallback message.
+
+Export async function notifyUser(title, message, logger?): runs osascript with 'display notification "<message>" with title "<title>"'. Swallow all errors.
+
+Tests: detectIde returns correct config for each bundle ID; detectIde uses VSCODE_GIT_ASKPASS_NODE fallback; detectIde returns null when no env vars set; writeWorktreeTasksFile creates file when none exists; writeWorktreeTasksFile merges into existing; writeWorktreeTasksFile is idempotent (returns "unchanged" on second call); tasks have correct labels and properties.
+
+MODULE 8: DAEMON-SERVER (src/daemon-server.ts, test/daemon.test.ts, test/cleanup-logic.test.ts)
+
+Imports: node:net, node:fs, node:child_process, node:path, node:util, node:events, git.ts (isBranchMerged, hasNewCommits, onlyIgnorableChanges, removeWorktreeAndBranch), ide.ts (notifyUser), logger.
+
+Export interface DaemonConfig: { heartbeatTimeoutMs: number, checkIntervalMs: number, idleShutdownMs: number, logger?: Logger }.
+Export interface WorktreeState: { lastHeartbeat: number, parentBranch: string, parentCommit: string }.
+Export interface DaemonHandle: { server: net.Server, heartbeats: Map<string, WorktreeState>, events: EventEmitter, shutdown: () => void }.
+
+Default config values: heartbeatTimeoutMs 15000, checkIntervalMs 5000, idleShutdownMs 60000.
+
+Export function createDaemonServer(socketPath, repoRoot, config?): creates a net.Server listening on socketPath. On connection: accumulate data in a buffer, split on newlines, JSON.parse each line. For "register" messages: store worktree name with parentBranch, parentCommit, and current timestamp. For "heartbeat" messages: update lastHeartbeat to Date.now(); if worktree not registered, create entry with empty parentBranch and parentCommit. Ignore malformed JSON (catch and continue). Set up setInterval at checkIntervalMs: iterate heartbeats map, if Date.now() - lastHeartbeat > heartbeatTimeoutMs, trigger cleanup for that worktree and delete from map. After cleanup check, if heartbeats.size === 0, track idle time; if idle exceeds idleShutdownMs, call shutdown and emit "idle-shutdown". The shutdown function: clear the interval, close the server, remove socket file (ignore errors). Emit "listening" when server starts, "error" on server error, "cleanup" when evaluating a worktree.
+
+Cleanup logic for a timed-out worktree: (1) Kill tmux session via execFile("tmux", ["kill-session", "-t", worktreeName]); ignore errors. (2) If no parentBranch or no parentCommit: force delete via removeWorktreeAndBranch, return. (3) Check onlyIgnorableChanges on the worktree path (join repoRoot, ".worktrees", worktreeName): if false (has real changes), preserve the worktree and notify user, return. (4) Check hasNewCommits: if false (no new commits), delete via removeWorktreeAndBranch, return. (5) Check isBranchMerged: if true, delete via removeWorktreeAndBranch, return. (6) If not merged, preserve and notify user. (7) Wrap the entire evaluation in try/catch: on error, preserve the worktree (safe default), log the error.
+
+Tests for daemon.test.ts: server starts and emits "listening"; register message stores state; heartbeat message updates timestamp; unregistered heartbeat creates entry with empty parent info; server handles malformed JSON without crashing; idle shutdown triggers after configured time.
+
+Tests for cleanup-logic.test.ts: test all 4 cleanup branches: (a) worktree with uncommitted non-ignorable changes is preserved; (b) worktree with no new commits is deleted; (c) worktree with merged commits is deleted; (d) worktree with unmerged commits is preserved. Also test: cleanup on error preserves worktree; no-parent-info path forces deletion.
+
+MODULE 9: CLI ENTRY POINTS
+
+src/cli/daemon.ts: parses positional repoRoot and --silent, --heartbeat-timeout, --check-interval flags. Computes socket path. Ensures socket dir. Runs cleanStaleSocket; if live daemon found, log and exit 0. Creates logger at <socketDir>/daemon.log. Writes a session header to the log file synchronously (using fs.appendFileSync). Creates daemon server. Handles SIGINT, SIGTERM, process "exit" to unlink socket file (ignore errors). Listens for "idle-shutdown" event to process.exit(0).
+
+src/cli/heartbeat.ts: parses --repo-root, --worktree, --silent, --interval flags. Computes socket path. Creates logger at <socketDir>/daemon.log. Sends an immediate heartbeat. Sets setInterval to send heartbeats at the configured interval.
+
+src/cli/pick-repo.ts: the main orchestrator. Parses positional worktree name, --inspectHB flag, --pick flag. Sanitizes the name: replace invalid git ref chars (space, tilde, caret, colon, question mark, asterisk, brackets, backslash) with underscore; replace ".." with underscore; replace "@{" with underscore; remove ".lock" suffix; remove leading/trailing dots and slashes; collapse consecutive slashes and underscores; trim leading/trailing underscores. If sanitized name is empty, exit 1. If not --pick: call getSuperprojectRoot(__dirname); if found, use as repo folder. If no folder yet: show macOS folder picker via osascript "choose folder". Validate repo. Capture parent branch (git symbolic-ref --short HEAD) and parent commit (git rev-parse HEAD). Create worktree. Check if daemon socket is alive; if not, ensure socket dir, start daemon in tmux (tmux new-session -d -s <sessionName> <daemonCmd>), with fallback to detached spawn if tmux fails. Poll socket liveness every 100ms for up to 5 seconds. Register worktree with daemon by connecting to socket and writing JSON register message with parentBranch and parentCommit. Create tmux session for worktree: top pane runs "claude --permission-mode plan", split-window vertical for terminal, select top pane, wait 3 seconds, send-keys "/rename <worktreeName>" Enter. Write .vscode/tasks.json into worktree. Detect and launch IDE. Read .gitignore; if ".worktrees" not present, prompt user via readline to add it.
+
+src/cli/install-parent-task.ts: calls getSuperprojectRoot(process.cwd()). If null, log "Not a submodule" and exit 0. Compute relative path via path.relative(superprojectRoot, cwd). Read or create <superprojectRoot>/.vscode/tasks.json (skeleton: { version: "2.0.0", tasks: [], inputs: [] }). If task with label "Worktree: Pick Repository" exists, log and exit 0. Inject "Build (worktree-spawn-util)" task: type shell, command npm, args ["run", "build"], options.cwd "${workspaceFolder}/<relPath>", group "build", presentation reveal silent, problemMatcher ["$tsc"]. Inject "Worktree: Pick Repository" task: type shell, command node, args ["${workspaceFolder}/<relPath>/dist/cli/pick-repo.js", "${input:worktreeName}"], presentation reveal always/panel new/focus true, problemMatcher [], dependsOn ["Build (worktree-spawn-util)"]. Inject worktreeName input if not present: { id: "worktreeName", type: "promptString", description: "Worktree name" }. Write JSON with 2-space indent + trailing newline. Wrap main() in .catch for error handling.
+
+src/cli/spawn.ts: stub only. Parses positional name and --force flag. Logs them and exits 0.
+
+MODULE 10: BARREL EXPORT (src/index.ts)
+
+Re-export everything from: ./git.js, ./ide.js, ./process.js, ./config.js, ./socket.js, ./daemon-server.js, ./daemon-client.js, ./logger.js.
+
+MODULE 11: SETUP SCRIPT (RunMeFirst.sh)
+
+Bash script with set -e. Steps: (1) Check for Node.js; if missing, offer to install via Homebrew. (2) Check for tmux; if missing, offer to install via Homebrew. (3) Run npm install. (4) Run npm run build. (5) Run node dist/cli/install-parent-task.js (detects submodule and installs VS Code task into parent if applicable). (6) Print "Setup complete!".
+
+MODULE 12: SMOKE TEST (test/smoke.test.ts)
+
+Import from the barrel export "../src/index.js". Verify that key exports are defined: Logger, validateRepo, createWorktree, parseWorktreeList, detectIde, writeWorktreeTasksFile, createDaemonServer, sendHeartbeat, parseArgs, getSocketPath, ensureSocketDir, isSocketAlive, getSuperprojectRoot.
+
+CRITICAL IMPLEMENTATION DETAILS
+
+Unix socket communication: all messages are newline-delimited JSON over short-lived connections. Client connects, writes one message + newline, then ends the connection. Server accumulates data per connection in a buffer, splits on newlines, processes each JSON object independently.
+
+Socket path computation: SHA-256 hash of the output of fs/promises realpath(repoRoot), truncated to first 12 hex characters, with .sock extension, in the socket directory.
+
+Heartbeat system: the heartbeat process runs as a VS Code task with runOptions.runOn "folderOpen". When the IDE window closes, VS Code kills the task, which stops heartbeats. The daemon detects the absence of heartbeats (timeout > 15s) and triggers cleanup evaluation.
+
+Conditional cleanup decision tree (in exact order): (1) Kill tmux session for the worktree. (2) If no parent branch/commit info was registered, force-delete the worktree and branch. (3) If there are uncommitted changes outside .claude/ and .vscode/, preserve the worktree and send a macOS notification. (4) If there are no new commits beyond the parent commit, delete the worktree and branch. (5) If the branch is fully merged into the parent branch, delete the worktree and branch. (6) If the branch has unmerged commits, preserve the worktree and send a macOS notification. (7) If any error occurs during evaluation, preserve the worktree (safe default).
+
+All operations that create or modify state must be idempotent. Worktree creation returns existing if path+branch match. Task injection checks labels before adding. Parent task installer checks for existing task label. Daemon startup checks for live daemon via socket before starting.
+
+Error handling philosophy: safe defaults (preserve on error), graceful degradation (socket failures log but don't crash), best-effort side effects (notifications and file logging swallow errors), malformed input tolerance (daemon ignores bad JSON).
+
+Every module function that performs I/O accepts an optional Logger parameter as its last argument. All logging goes through this Logger instance when provided.
