@@ -11,6 +11,7 @@ import { validateRepo, createWorktree, getSuperprojectRoot } from "../git.js";
 import { detectIde, launchIde, writeWorktreeTasksFile } from "../ide.js";
 import { getSocketPath, ensureSocketDir, isSocketAlive, getDaemonSessionName } from "../socket.js";
 import { Logger } from "../logger.js";
+import { setupNodeProject } from "../node-setup.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -201,6 +202,9 @@ try {
 
 // --- Set up worktree IDE config ---
 const tasksStatus = await writeWorktreeTasksFile(worktreePath, worktreeName, selection.repoRoot, visible, logger);
+
+// --- Node project setup (npm install + build) ---
+await setupNodeProject(worktreePath, logger);
 
 // --- Open IDE window ---
 const ide = detectIde();

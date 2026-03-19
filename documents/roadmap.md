@@ -15,6 +15,7 @@
         else
             notify the user that the worktree has changes that need to be committed or stashed.
     - [x] when claude is spawned, name the conversation with the same name as the worktree.
-    - [ ] If worktree-spawn-util is installed as a submodule in another repo, do not prompt for the repo folder when pick-repo is invoked: use the parent repo as the repo folder.  This requires detecting in pick-repo if the script is running inside a folder that is a submodule of another repo. 
+    - [x] If worktree-spawn-util is installed as a submodule in another repo, do not prompt for the repo folder when pick-repo is invoked: use the parent repo as the repo folder.  This requires detecting in pick-repo if the script is running inside a folder that is a submodule of another repo. 
+    - [x] before opening the new IDE window, detect if the project is a node project.  if it is, run 'npm install' in the worktree folder.  if the project can be built, run 'npm run build' in the worktree folder.
     
 Future features (in order)
