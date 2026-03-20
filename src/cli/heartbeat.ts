@@ -6,12 +6,13 @@ import { join } from "node:path";
 import { getSocketPath, getSocketDir } from "../socket.js";
 import { parseArgs, sendHeartbeat } from "../daemon-client.js";
 import { Logger } from "../logger.js";
+import { DAEMON_FLAG_SILENT, HEARTBEAT_FLAG_INTERVAL } from "../cli-flags.js";
 
 const allArgs = process.argv.slice(2);
-const silent = allArgs.includes("--silent");
-const intervalArg = allArgs.find((a) => a.startsWith("--interval="));
+const silent = allArgs.includes(DAEMON_FLAG_SILENT);
+const intervalArg = allArgs.find((a) => a.startsWith(HEARTBEAT_FLAG_INTERVAL + "="));
 const HEARTBEAT_INTERVAL_MS = parseInt(intervalArg?.split("=")[1] ?? "5000");
-const filteredArgs = allArgs.filter((a) => a !== "--silent" && !a.startsWith("--interval="));
+const filteredArgs = allArgs.filter((a) => a !== DAEMON_FLAG_SILENT && !a.startsWith(HEARTBEAT_FLAG_INTERVAL + "="));
 const { repoRoot, worktree } = parseArgs(filteredArgs);
 
 if (!repoRoot || !worktree) {

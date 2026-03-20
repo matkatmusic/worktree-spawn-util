@@ -7,11 +7,12 @@ import { join } from "node:path";
 import { getSocketPath, getSocketDir, ensureSocketDir, cleanStaleSocket } from "../socket.js";
 import { createDaemonServer } from "../daemon-server.js";
 import { Logger } from "../logger.js";
+import { DAEMON_FLAG_SILENT, DAEMON_FLAG_HEARTBEAT_TIMEOUT, DAEMON_FLAG_CHECK_INTERVAL } from "../cli-flags.js";
 
 const args = process.argv.slice(2);
-const silent = args.includes("--silent");
-const heartbeatTimeoutMs = parseInt(args.find((a) => a.startsWith("--heartbeat-timeout="))?.split("=")[1] ?? "15000");
-const checkIntervalMs = parseInt(args.find((a) => a.startsWith("--check-interval="))?.split("=")[1] ?? "5000");
+const silent = args.includes(DAEMON_FLAG_SILENT);
+const heartbeatTimeoutMs = parseInt(args.find((a) => a.startsWith(DAEMON_FLAG_HEARTBEAT_TIMEOUT + "="))?.split("=")[1] ?? "15000");
+const checkIntervalMs = parseInt(args.find((a) => a.startsWith(DAEMON_FLAG_CHECK_INTERVAL + "="))?.split("=")[1] ?? "5000");
 const repoRoot = args.find((a) => !a.startsWith("--"));
 
 // Early logger (no file path yet — just console output for early-exit messages)

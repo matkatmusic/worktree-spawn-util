@@ -12,6 +12,7 @@ import { detectIde, launchIde, writeWorktreeTasksFile } from "../ide.js";
 import { getSocketPath, ensureSocketDir, isSocketAlive, getDaemonSessionName } from "../socket.js";
 import { Logger } from "../logger.js";
 import { setupNodeProject } from "../node-setup.js";
+import { PICK_REPO_FLAG_INSPECT_HB, PICK_REPO_FLAG_PICK } from "../cli-flags.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -48,8 +49,8 @@ async function pickFolder(): Promise<string | null> {
 
 // --- Parse args ---
 const cliArgs = process.argv.slice(2);
-const visible = cliArgs.includes("--inspectHB");
-const forcePick = cliArgs.includes("--pick");
+const visible = cliArgs.includes(PICK_REPO_FLAG_INSPECT_HB);
+const forcePick = cliArgs.includes(PICK_REPO_FLAG_PICK);
 const rawName = cliArgs.find((a) => !a.startsWith("--")) ?? "";
 
 if (!rawName.trim()) {

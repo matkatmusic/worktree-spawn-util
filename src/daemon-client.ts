@@ -2,6 +2,7 @@
 
 import { createConnection } from "node:net";
 import type { Logger } from "./logger.js";
+import { HEARTBEAT_FLAG_REPO_ROOT, HEARTBEAT_FLAG_WORKTREE } from "./cli-flags.js";
 
 /** Parse --repo-root and --worktree from CLI args. */
 export function parseArgs(args: string[]): { repoRoot: string; worktree: string } {
@@ -9,10 +10,10 @@ export function parseArgs(args: string[]): { repoRoot: string; worktree: string 
   let worktree = "";
 
   for (let i = 0; i < args.length; i++) {
-    if (args[i] === "--repo-root" && args[i + 1]) {
+    if (args[i] === HEARTBEAT_FLAG_REPO_ROOT && args[i + 1]) {
       repoRoot = args[i + 1];
       i++;
-    } else if (args[i] === "--worktree" && args[i + 1]) {
+    } else if (args[i] === HEARTBEAT_FLAG_WORKTREE && args[i + 1]) {
       worktree = args[i + 1];
       i++;
     }

@@ -6,10 +6,45 @@
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { join, relative } from "node:path";
 import { getSuperprojectRoot } from "../git.js";
+import {
+  PICK_REPO_FLAG_INSPECT_HB,
+  PICK_REPO_FLAG_PICK,
+  DAEMON_FLAG_HEARTBEAT_TIMEOUT,
+  DAEMON_FLAG_CHECK_INTERVAL,
+} from "../cli-flags.js";
 
 const TASK_LABEL = "Worktree: Pick Repository";
-const BUILD_LABEL = "Build (worktree-spawn-util)";
 const INPUT_ID = "worktreeName";
+
+function taskCommand(): string {
+  return `npm run build && node dist/cli/pick-repo.js \${input:${INPUT_ID}}`;
+}
+
+function buildUsageComment(indent: string): string {
+  const pad = indent + "   ";
+  return [
+    `${indent}/*`,
+    `${indent}Optional args:`,
+    `${pad}${PICK_REPO_FLAG_INSPECT_HB}: show heartbeat & daemon panels in worktree IDE`,
+    `${pad}${PICK_REPO_FLAG_PICK} <path/to/repo>: force manual folder picker (skip submodule auto-detect)`,
+    ` `,
+    `${pad}Daemon-specific args (passed through when daemon starts):`,
+    `${pad}${DAEMON_FLAG_HEARTBEAT_TIMEOUT}=<ms>: cleanup delay after last heartbeat (default 15000)`,
+    `${pad}${DAEMON_FLAG_CHECK_INTERVAL}=<ms>: how often daemon checks for expired worktrees (default 5000)`,
+    `${indent}*/`,
+  ].join("\n");
+}
+
+/** Strip JSONC comments (// line comments and /* block comments) so JSON.parse() works. */
+function stripJsonComments(text: string): string {
+  // Strip block comments
+  text = text.replace(/\/\*[\s\S]*?\*\//g, "");
+  // Strip line comments
+  return text
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("//"))
+    .join("\n");
+}
 
 interface TasksJsonFile {
   version: string;
@@ -36,7 +71,7 @@ async function main() {
   let tasksJson: TasksJsonFile;
   try {
     const raw = await readFile(tasksPath, "utf-8");
-    tasksJson = JSON.parse(raw);
+    tasksJson = JSON.parse(stripJsonComments(raw));
     if (!Array.isArray(tasksJson.tasks)) {
       tasksJson.tasks = [];
     }
@@ -53,32 +88,14 @@ async function main() {
     return;
   }
 
-  // Inject Build task (namespaced to avoid collision)
-  if (!tasksJson.tasks.some((t) => t.label === BUILD_LABEL)) {
-    tasksJson.tasks.push({
-      label: BUILD_LABEL,
-      type: "shell",
-      command: "npm",
-      args: ["run", "build"],
-      options: { cwd: `\${workspaceFolder}/${relPath}` },
-      group: "build",
-      presentation: { reveal: "silent" },
-      problemMatcher: ["$tsc"],
-    });
-  }
-
-  // Inject Pick Repository task
+  // Inject consolidated task (build + pick-repo in one command)
   tasksJson.tasks.push({
     label: TASK_LABEL,
     type: "shell",
-    command: "node",
-    args: [
-      `\${workspaceFolder}/${relPath}/dist/cli/pick-repo.js`,
-      `\${input:${INPUT_ID}}`,
-    ],
+    command: taskCommand(),
+    options: { cwd: `\${workspaceFolder}/${relPath}` },
     presentation: { reveal: "always", panel: "new", focus: true },
-    problemMatcher: [],
-    dependsOn: [BUILD_LABEL],
+    problemMatcher: ["$tsc"],
   });
 
   // Inject worktreeName input if missing
@@ -90,9 +107,16 @@ async function main() {
     });
   }
 
-  // Write back
+  // Write back with usage comment above our command line
   await mkdir(vscodeDir, { recursive: true });
-  await writeFile(tasksPath, JSON.stringify(tasksJson, null, 2) + "\n");
+  const json = JSON.stringify(tasksJson, null, 2);
+  const lines = json.split("\n");
+  const cmdIdx = lines.findIndex((l) => l.includes(taskCommand()));
+  if (cmdIdx !== -1) {
+    const indent = lines[cmdIdx].match(/^(\s*)/)?.[1] ?? "";
+    lines.splice(cmdIdx, 0, buildUsageComment(indent));
+  }
+  await writeFile(tasksPath, lines.join("\n") + "\n");
   console.log(`[install-parent-task] Installed "${TASK_LABEL}" into ${tasksPath}`);
 }
 

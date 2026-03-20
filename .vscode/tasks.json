@@ -4,25 +4,17 @@
     {
       "label": "Worktree: Pick Repository",
       "type": "shell",
-      "command": "node",
-      "args": ["${workspaceFolder}/dist/cli/pick-repo.js", "${input:worktreeName}"],
-      // "args": ["${workspaceFolder}/dist/cli/pick-repo.js", "--inspectHB", "${input:worktreeName}"],
+      /* Optional args:
+         --inspectHB              show heartbeat & daemon panels in worktree IDE
+         --pick                   force manual folder picker (skip submodule auto-detect)
+         Daemon tuning (passed through when daemon starts):
+         --heartbeat-timeout=ms   cleanup delay after last heartbeat (default 15000)
+         --check-interval=ms      how often daemon checks for expired worktrees (default 5000) */
+      "command": "npm run build && node dist/cli/pick-repo.js ${input:worktreeName}",
       "presentation": {
         "reveal": "always",
         "panel": "new",
         "focus": true
-      },
-      "problemMatcher": [],
-      "dependsOn": ["Build"]
-    },
-    {
-      "label": "Build",
-      "type": "shell",
-      "command": "npm",
-      "args": ["run", "build"],
-      "group": "build",
-      "presentation": {
-        "reveal": "silent"
       },
       "problemMatcher": ["$tsc"]
     }
