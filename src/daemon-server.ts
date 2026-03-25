@@ -25,9 +25,15 @@ export interface WorktreeState {
   parentCommit: string;
 }
 
+export interface PendingRegistration {
+  parentBranch: string;
+  parentCommit: string;
+}
+
 export interface DaemonHandle {
   server: Server;
   heartbeats: Map<string, WorktreeState>;
+  pendingRegistrations: Map<string, PendingRegistration>;
   events: EventEmitter;
   shutdown: () => void;
 }
@@ -54,6 +60,7 @@ export function createDaemonServer(
   const cfg: DaemonConfig = { ...DEFAULT_CONFIG, ...config };
   const logger = cfg.logger;
   const heartbeats = new Map<string, WorktreeState>();
+  const pendingRegistrations = new Map<string, PendingRegistration>();
   const events = new EventEmitter();
   let lastActivityTime = Date.now();
 
@@ -139,19 +146,37 @@ export function createDaemonServer(
         try {
           const msg = JSON.parse(line);
           if (msg.type === "register" && typeof msg.worktree === "string" && msg.parentBranch && msg.parentCommit) {
-            heartbeats.set(msg.worktree, {
-              lastHeartbeat: Date.now(),
-              parentBranch: msg.parentBranch,
-              parentCommit: msg.parentCommit,
-            });
+            const existing = heartbeats.get(msg.worktree);
+            if (existing) {
+              // Re-registration: update parent info in-place
+              existing.parentBranch = msg.parentBranch;
+              existing.parentCommit = msg.parentCommit;
+            } else {
+              // Store as pending — timeout tracking starts on first heartbeat
+              pendingRegistrations.set(msg.worktree, {
+                parentBranch: msg.parentBranch,
+                parentCommit: msg.parentCommit,
+              });
+            }
             lastActivityTime = Date.now();
             logger?.log(`[daemon] Registered worktree "${msg.worktree}" (parent: ${msg.parentBranch}@${msg.parentCommit.slice(0, 7)})`);
           } else if (msg.type === "heartbeat" && typeof msg.worktree === "string") {
-            const existing = heartbeats.get(msg.worktree);
-            if (existing) {
-              existing.lastHeartbeat = Date.now();
+            const pending = pendingRegistrations.get(msg.worktree);
+            if (pending) {
+              // First heartbeat for a pending registration — activate tracking
+              heartbeats.set(msg.worktree, {
+                lastHeartbeat: Date.now(),
+                parentBranch: pending.parentBranch,
+                parentCommit: pending.parentCommit,
+              });
+              pendingRegistrations.delete(msg.worktree);
             } else {
-              heartbeats.set(msg.worktree, { lastHeartbeat: Date.now(), parentBranch: "", parentCommit: "" });
+              const active = heartbeats.get(msg.worktree);
+              if (active) {
+                active.lastHeartbeat = Date.now();
+              } else {
+                heartbeats.set(msg.worktree, { lastHeartbeat: Date.now(), parentBranch: "", parentCommit: "" });
+              }
             }
             lastActivityTime = Date.now();
             const seqStr = typeof msg.seq === "number" ? ` #${msg.seq}` : "";
@@ -194,7 +219,7 @@ export function createDaemonServer(
       await cleanupWorktree(name, state);
     }
 
-    if (heartbeats.size === 0 && now - lastActivityTime > cfg.idleShutdownMs) {
+    if (heartbeats.size === 0 && pendingRegistrations.size === 0 && now - lastActivityTime > cfg.idleShutdownMs) {
       logger?.log("[daemon] Idle — shutting down");
       logger?.log("=== SESSION END (idle-shutdown) ===");
       events.emit("idle-shutdown");
@@ -214,5 +239,5 @@ export function createDaemonServer(
     });
   }
 
-  return { server, heartbeats, events, shutdown };
+  return { server, heartbeats, pendingRegistrations, events, shutdown };
 }
