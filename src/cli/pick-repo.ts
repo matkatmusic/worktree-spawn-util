@@ -51,7 +51,7 @@ async function pickFolder(): Promise<string | null> {
 const cliArgs = process.argv.slice(2);
 const visible = cliArgs.includes(PICK_REPO_FLAG_INSPECT_HB);
 const forcePick = cliArgs.includes(PICK_REPO_FLAG_PICK);
-const rawName = cliArgs.find((a) => !a.startsWith("--")) ?? "";
+const rawName = cliArgs.filter((a) => !a.startsWith("--")).join("_");
 
 if (!rawName.trim()) {
   logger.error("[pick-repo] No worktree name provided.");
