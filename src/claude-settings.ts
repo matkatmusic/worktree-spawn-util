@@ -26,7 +26,9 @@ const DEFAULT_WORKTREE_PERMISSIONS: string[] = [
   "Bash(tmux list-sessions:*)",
   "Bash(tmux send-keys:*)",
   "Bash(tmux list-panes:*)",
-  "Bash(git add:*)"
+  "Bash(git add:*)",
+  "Bash(git fetch:*)",
+  "Bash(git rebase:*)"
 ];
 
 /**
