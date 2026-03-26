@@ -10,3 +10,4 @@ export * from "./daemon-server.js";
 export * from "./daemon-client.js";
 export * from "./logger.js";
 export * from "./node-setup.js";
+export * from "./claude-settings.js";
