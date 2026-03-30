@@ -2,8 +2,7 @@
 
 // heartbeat CLI — thin wrapper around heartbeat/client.ts
 
-import { join } from "node:path";
-import { getSocketPath, getSocketDir } from "../socket.js";
+import { getSocketPath, getDaemonLogPath } from "../socket.js";
 import { parseArgs, sendHeartbeat } from "../daemon-client.js";
 import { Logger } from "../logger.js";
 import { DAEMON_FLAG_SILENT, HEARTBEAT_FLAG_INTERVAL } from "../cli-flags.js";
@@ -22,7 +21,7 @@ if (!repoRoot || !worktree) {
 
 const socketPath = await getSocketPath(repoRoot);
 
-const logFile = join(getSocketDir(), "daemon.log");
+const logFile = await getDaemonLogPath(repoRoot);
 const logger = new Logger(logFile, { silent });
 
 logger.log(`[heartbeat] Starting for worktree "${worktree}" -> ${socketPath}`);

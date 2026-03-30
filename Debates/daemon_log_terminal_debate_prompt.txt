@@ -1,0 +1,120 @@
+DEBATE PROMPT: Review of "Daemon Log Terminal in Parent IDE" Implementation Plan
+
+You are reviewing an implementation plan for issues, risks, and correctness problems BEFORE it gets implemented. Your job is to find bugs, design flaws, race conditions, missing edge cases, and incorrect assumptions that would cause problems during implementation.
+
+The plan is for a tool called "worktree-spawn-util" — a Node.js/TypeScript CLI that manages git worktrees, spawns tmux sessions, and coordinates with IDE instances (VS Code, Antigravity). It has a daemon process that monitors worktree lifecycle via heartbeats over Unix sockets.
+
+======= THE PLAN TO REVIEW =======
+
+# Daemon Log Terminal in Parent IDE
+
+## Context
+
+When a worktree is spawned via `pick-repo`, a daemon starts in a hidden tmux session. Its output (registration, heartbeats, cleanup decisions) is invisible unless `--inspectHB` is used. This change makes daemon activity visible by auto-opening a `tail -F` terminal in the parent IDE window.
+
+All changes are in `worktree-spawn-util/`.
+
+---
+
+## Step 1: Per-repo log path utility (`src/socket.ts`)
+
+Add `basename` to the `node:path` import. Add exported function:
+
+```typescript
+export function getDaemonLogPath(repoRoot: string): string {
+  return join(getSocketDir(), `${basename(repoRoot)}.daemon.log`);
+}
+```
+
+## Step 2: Log pruning module (`src/log-pruning.ts` — new file)
+
+Export `pruneLogFile(logPath: string, maxAgeDays: number): void`
+
+Logic:
+- Read file (return if missing)
+- Parse each line for ISO timestamps: `[YYYY-MM-DDTHH:mm:ss.sssZ]` in regular lines, `=== SESSION START [ISO] ===` in headers
+- Lines between `=== SESSION START` and `========================` inherit the header timestamp
+- Drop lines older than `maxAgeDays`
+- Lines without any timestamp context: keep (conservative)
+- Rewrite file with kept lines
+
+Tests provided for: missing file, all recent, all old, mixed sessions, orphaned lines, boundary (exactly 14 days).
+
+## Step 3: Per-repo log + timestamp + pruning in daemon CLI (`src/cli/daemon.ts`)
+
+Changes:
+1. Import `getDaemonLogPath` from `../socket.js` and `pruneLogFile` from `../log-pruning.js`
+2. Replace `const logFile = join(getSocketDir(), "daemon.log")` with `const logFile = getDaemonLogPath(repoRoot)`
+3. Call `pruneLogFile(logFile, 14)` before the session header write
+4. Change session header from `=== SESSION START ===` to `=== SESSION START [${new Date().toISOString()}] ===`
+
+## Step 4: Extend IdeConfig with uriScheme (`src/ide.ts`)
+
+1. Add `uriScheme?: string` to `IdeConfig` type
+2. Add constant:
+   ```typescript
+   const IDE_URI_SCHEME_MAP: Record<string, string> = {
+     "code": "vscode",
+     "agy": "antigravity",
+   };
+   ```
+3. Update all `detectIde()` return paths to include `uriScheme: IDE_URI_SCHEME_MAP[command]` (undefined for `code-insiders`)
+
+## Step 5: `openDaemonLogTerminal` function (`src/ide.ts`)
+
+New exported function:
+
+```typescript
+export function openDaemonLogTerminal(
+  uriScheme: string,
+  logPath: string,
+  repoBasename: string,
+  logger?: Logger,
+): void
+```
+
+- Build config: `{ command: "tail -F {logPath}", name: "Daemon Log — {repoBasename}", color: "cyan", autoFocus: false }`
+- Encode: `btoa(encodeURIComponent(JSON.stringify(config)))`
+- URI: `{uriScheme}://open.in-terminal?config={encoded}&encoded=1`
+- Execute: `spawn("open", [uri], { detached: true, stdio: "ignore" })` + `unref()`
+
+## Step 6: Integrate into `pick-repo.ts` (`src/cli/pick-repo.ts`)
+
+Reorder the daemon/IDE section to:
+1. (existing) Create worktree, capture parent branch info
+2. `const ide = detectIde()` — move up from bottom of file
+3. `const daemonAlive = await isSocketAlive(socketPath)` — check early
+4. `const logPath = getDaemonLogPath(selection.repoRoot)` — compute log path
+5. Touch log file: `writeFileSync(logPath, "", { flag: "a" })` — ensures file exists
+6. If `!daemonAlive && ide && ide.uriScheme`: call `openDaemonLogTerminal(ide.uriScheme, logPath, basename(selection.repoRoot), logger)`
+7. Start daemon if `!daemonAlive` (existing spawn logic)
+8. Register worktree (existing)
+9. (existing) Create tmux session, write tasks, setup node, launch IDE
+
+======= END OF PLAN =======
+
+IMPORTANT CONTEXT — Current source files you should reference:
+- The codebase is at: /Users/matkatmusicllc/Programming/authv5-workspace/review-agent-orchestrator/worktree-spawn-util/
+- Source files: src/socket.ts, src/ide.ts, src/cli/daemon.ts, src/cli/pick-repo.ts
+- Test files: test/socket.test.ts, test/ide.test.ts
+- Platform docs: /Users/matkatmusicllc/Programming/authv5-workspace/review-agent-orchestrator/worktree-spawn-util/documents/platform-docs.md
+
+YOUR TASK:
+
+Read the actual source files listed above, then critically review this plan. For each issue found, categorize it as:
+
+- [BLOCKER] — Will cause a runtime error, test failure, or incorrect behavior. Must fix before implementing.
+- [RISK] — Could cause problems under certain conditions. Should be addressed.
+- [NIT] — Minor improvement or style concern. Optional.
+
+Focus especially on:
+1. Race conditions (e.g., log terminal opens before daemon writes to log file)
+2. Incorrect assumptions about existing code (e.g., variable names, function signatures, imports that don't exist)
+3. Missing error handling that would crash the process
+4. Platform-specific issues (macOS `open` command, URI scheme handling)
+5. Test correctness (do the tests actually verify what they claim?)
+6. Log pruning edge cases (timestamp parsing, file locking, concurrent access)
+7. Whether `code-insiders` being excluded from URI schemes is intentional or an oversight
+8. The `open.in-terminal` URI protocol — is this a real VS Code / Antigravity protocol, or is this made up?
+
+Write your response as a numbered list of findings with category tags. Be specific — reference line numbers and exact code when possible. End with a summary verdict: APPROVE (safe to implement as-is), CONDITIONAL (implement with fixes), or REJECT (needs redesign).

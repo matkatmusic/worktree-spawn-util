@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, symlink, stat, realpath, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
 import { createServer, type Server } from "node:net";
 import {
@@ -10,6 +10,7 @@ import {
   getDaemonSessionName,
   isSocketAlive,
   cleanStaleSocket,
+  getDaemonLogPath,
 } from "../src/socket.js";
 
 describe("getSocketDir", () => {
@@ -218,5 +219,53 @@ describe("cleanStaleSocket", () => {
   it("returns true (no-op) when socket file does not exist", async () => {
     const removed = await cleanStaleSocket(testSocketPath);
     expect(removed).toBe(true);
+  });
+});
+
+describe("getDaemonLogPath", () => {
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await realpath(await mkdtemp(join(tmpdir(), "logpath-test-")));
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("returns a path ending with {basename}-{hash}.daemon.log", async () => {
+    const result = await getDaemonLogPath(tmpDir);
+    const dirName = basename(tmpDir);
+    expect(result).toMatch(new RegExp(`${dirName}-[0-9a-f]{8}\\.daemon\\.log$`));
+  });
+
+  it("uses the socket directory as parent", async () => {
+    const result = await getDaemonLogPath(tmpDir);
+    expect(result).toContain(getSocketDir());
+  });
+
+  it("is deterministic", async () => {
+    const p1 = await getDaemonLogPath(tmpDir);
+    const p2 = await getDaemonLogPath(tmpDir);
+    expect(p1).toBe(p2);
+  });
+
+  it("produces different paths for different repo roots", async () => {
+    const tmpDir2 = await realpath(await mkdtemp(join(tmpdir(), "logpath-test2-")));
+    try {
+      const p1 = await getDaemonLogPath(tmpDir);
+      const p2 = await getDaemonLogPath(tmpDir2);
+      expect(p1).not.toBe(p2);
+    } finally {
+      await rm(tmpDir2, { recursive: true, force: true });
+    }
+  });
+
+  it("resolves symlinks — symlink and real path produce same log path", async () => {
+    const symlinkPath = join(tmpDir, "link-to-self");
+    await symlink(tmpDir, symlinkPath);
+    const pathFromReal = await getDaemonLogPath(tmpDir);
+    const pathFromLink = await getDaemonLogPath(symlinkPath);
+    expect(pathFromReal).toBe(pathFromLink);
   });
 });

@@ -1,0 +1,37 @@
+REVIEW: "Daemon Log Terminal in Parent IDE" Implementation Plan
+Reviewer: Codex (GPT-5.4)
+Date: 2026-03-30
+
+================================================================
+FINDINGS
+================================================================
+
+1. [BLOCKER] `getDaemonLogPath` uses `basename(repoRoot)` which conflicts with the project's existing per-repo identity model. Both socket paths and daemon session names are derived from `realpath(repoRoot)` plus a hash in src/socket.ts:39 and src/socket.ts:49. Two unrelated repos named `frontend` will share one log file, and symlinked paths can produce inconsistent log identities. The log key needs the same canonical hashed identity.
+
+2. [BLOCKER] The plan only moves the daemon CLI to a per-repo log, but heartbeats still write to the global log in src/cli/heartbeat.ts:25. That breaks the stated goal of surfacing "registration, heartbeats, cleanup decisions" in one parent-IDE terminal: the tail window would follow `<repo>.daemon.log` while heartbeats continue going to `/tmp/.../daemon.log`.
+
+3. [BLOCKER] Step 6 touches the log file before ensuring the socket/log directory exists. In the current flow, `ensureSocketDir()` only happens inside the `!daemonAlive` branch at src/cli/pick-repo.ts:133. On a first run, `writeFileSync(logPath, "", { flag: "a" })` will throw `ENOENT` and abort `pick-repo`.
+
+4. [BLOCKER] `tail -F {logPath}` is not shell-safe. The repo folder comes from an arbitrary Finder selection in src/cli/pick-repo.ts:38, and `validateRepo()` does not sanitize the basename in src/git.ts:41. A repo like `My Project` or `foo&bar` yields a log filename that will be misparsed by the terminal shell unless it is correctly quoted/escaped.
+
+5. [BLOCKER] Excluding `code-insiders` from `uriScheme` looks wrong, not intentional. `detectIde()` explicitly supports it in src/ide.ts:23, and tests assert that behavior in test/ide.test.ts:32 and test/ide.test.ts:48. VS Code's official `onUri` docs say extension URIs use `vscode` or `vscode-insiders`, so returning `undefined` for Insiders would silently disable the feature in a currently supported IDE.
+
+6. [BLOCKER] `open.in-terminal` is real, but not built-in. It is provided by a specific VS Code extension, not by VS Code itself. The plan assumes that protocol exists in the parent IDE with no capability check, no dependency check, and no fallback. For Antigravity, `antigravity://open.in-terminal?...` is speculative; no authoritative documentation confirms that scheme or this extension interop there.
+
+7. [BLOCKER] The test plan is incomplete, and current tests will fail if implemented literally. `detectIde()` is asserted with exact object equality in test/ide.test.ts:27, test/ide.test.ts:33, and test/ide.test.ts:37. Adding `uriScheme` changes those expectations, but the plan only mentions new pruning tests and omits required updates plus new tests for `getDaemonLogPath()` and `openDaemonLogTerminal()`.
+
+8. [RISK] The terminal only opens when `!daemonAlive`, but the daemon is long-lived per repo in the current flow at src/cli/pick-repo.ts:128 and src/cli/pick-repo.ts:163. That means later `pick-repo` runs for the same repo will not open the log terminal at all, even though they still produce registration/heartbeat activity. This does not fully match the stated feature goal.
+
+================================================================
+SUMMARY VERDICT: REJECT (needs redesign)
+================================================================
+
+7 blockers found. The plan cannot be implemented as-is without runtime crashes, silent feature failures, and incomplete log routing. Key issues:
+
+(A) Log path identity model conflicts with existing hash-based approach — collision risk.
+(B) Heartbeat CLI still writes to global log — feature goal is not achieved.
+(C) `ensureSocketDir()` ordering means first-run crash.
+(D) `open.in-terminal` URI protocol requires an unmentioned VS Code extension and is unverified for Antigravity.
+(E) `code-insiders` silently excluded from feature.
+(F) Shell-unsafe log paths from unsanitized repo names.
+(G) Test plan incomplete — existing tests break on `uriScheme` addition.

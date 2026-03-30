@@ -2,14 +2,15 @@
 
 import { execFile, spawn } from "node:child_process";
 import { readFile, appendFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { writeFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { createConnection } from "node:net";
 import { fileURLToPath } from "node:url";
 import * as readline from "node:readline/promises";
 import { promisify } from "node:util";
 import { validateRepo, createWorktree, getSuperprojectRoot } from "../git.js";
-import { detectIde, launchIde, writeWorktreeTasksFile } from "../ide.js";
-import { getSocketPath, ensureSocketDir, isSocketAlive, getDaemonSessionName } from "../socket.js";
+import { detectIde, launchIde, writeWorktreeTasksFile, openDaemonLogTerminal } from "../ide.js";
+import { getSocketPath, ensureSocketDir, isSocketAlive, getDaemonSessionName, getDaemonLogPath } from "../socket.js";
 import { Logger } from "../logger.js";
 import { setupNodeProject } from "../node-setup.js";
 import { writeClaudeSettingsFile } from "../claude-settings.js";
@@ -125,12 +126,31 @@ try {
   process.exit(1);
 }
 
-// --- Ensure daemon is running ---
+// --- Detect IDE early (before daemon start, so we can open terminal in parent window) ---
+const ide = detectIde();
+
+// --- Check daemon status ---
 const socketPath = await getSocketPath(selection.repoRoot);
 const daemonAlive = await isSocketAlive(socketPath);
 
+// --- Ensure socket dir + log file exist before opening terminal ---
+ensureSocketDir();
+const logPath = await getDaemonLogPath(selection.repoRoot);
+
+// Touch log file with marker (only on first create)
+try {
+  writeFileSync(logPath, "Waiting for daemon...\n", { flag: "ax" });
+} catch {
+  // File already exists — fine
+}
+
+// --- Open daemon log terminal in parent IDE (before daemon start so tail catches header) ---
+if (!daemonAlive && ide && ide.uriScheme) {
+  openDaemonLogTerminal(ide.uriScheme, logPath, basename(selection.repoRoot), logger);
+}
+
+// --- Start daemon if needed ---
 if (!daemonAlive) {
-  ensureSocketDir();
   const daemonPath = join(__dirname, "daemon.js");
   const sessionName = await getDaemonSessionName(selection.repoRoot);
   const daemonCmd = `node "${daemonPath}" "${selection.repoRoot}"`;
@@ -158,7 +178,7 @@ if (!daemonAlive) {
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   if (!(await isSocketAlive(socketPath))) {
-    logger.warn("[pick-repo] WARNING: Daemon socket not ready after 5s — worktree cleanup may not work");
+    logger.warn("[pick-repo] WARNING: Daemon socket not ready after 5s");
   }
 } else {
   logger.log("[pick-repo] Daemon already running for this repo");
@@ -183,7 +203,7 @@ if (parentBranch && parentCommit) {
 try {
   await execFileAsync("tmux", [
     "new-session", "-d", "-s", worktreeName, "-c", worktreePath,
-    "claude", "--permission-mode", "plan",
+    "zsh", "-c", "source ~/.claude/init.sh && claude --permission-mode plan",
   ]);
   await execFileAsync("tmux", [
     "split-window", "-v", "-t", worktreeName, "-c", worktreePath,
@@ -205,6 +225,17 @@ try {
 // --- Set up worktree IDE config ---
 const tasksStatus = await writeWorktreeTasksFile(worktreePath, worktreeName, selection.repoRoot, visible, logger);
 
+// Prevent worktree-specific tasks.json changes from being committed
+try {
+  await execFileAsync("git", [
+    "-C", worktreePath,
+    "update-index", "--skip-worktree", ".vscode/tasks.json",
+  ]);
+  logger.log("[pick-repo] Marked .vscode/tasks.json as skip-worktree");
+} catch {
+  logger.warn("[pick-repo] Could not set skip-worktree on tasks.json");
+}
+
 // --- Claude settings (default permissions) ---
 await writeClaudeSettingsFile(worktreePath, logger);
 
@@ -212,7 +243,6 @@ await writeClaudeSettingsFile(worktreePath, logger);
 await setupNodeProject(worktreePath, logger);
 
 // --- Open IDE window ---
-const ide = detectIde();
 if (ide) {
   launchIde(ide, worktreePath, logger);
 } else {

@@ -1,0 +1,178 @@
+REVIEW: "Daemon Log Terminal in Parent IDE" Implementation Plan
+Reviewer: Security Auditor (Claude Opus 4.6)
+Date: 2026-03-30
+
+================================================================
+FINDINGS
+================================================================
+
+1. [BLOCKER] The `open.in-terminal` URI protocol does not exist.
+
+   Step 5 builds a URI like `vscode://open.in-terminal?config=...&encoded=1`
+   and fires it via macOS `open`. There is no VS Code built-in extension or
+   registered URI handler named `open.in-terminal`. VS Code's URI scheme
+   supports `vscode://file/...`, `vscode://vscode.git/...`, and extension-
+   contributed handlers, but not arbitrary terminal-opening URIs. Unless a
+   custom extension is installed that registers this handler, the `open`
+   command will either silently fail or show a "no handler" error. The plan
+   does not mention such an extension.
+
+   Antigravity ("agy") may have a custom URI handler for this, but that is
+   unspecified. The plan treats this as a universal mechanism for both IDEs.
+
+   Fix: Use the existing tasks.json approach (already proven in the codebase)
+   to add a `tail -F` task with `runOn: "folderOpen"`. This is exactly what
+   `writeWorktreeTasksFile` already does for heartbeat and daemon monitor
+   tasks. Alternatively, document/create the required VS Code extension.
+
+
+2. [BLOCKER] `basename` is not imported in pick-repo.ts.
+
+   Step 6 calls `basename(selection.repoRoot)` but the current pick-repo.ts
+   imports only `{ dirname, join }` from `node:path` (line 5). The plan says
+   to import `getDaemonLogPath` from socket.js but never mentions adding
+   `basename` to pick-repo.ts's own imports. This will cause a ReferenceError
+   at runtime.
+
+   Fix: Add `basename` to the `node:path` import in pick-repo.ts.
+
+
+3. [BLOCKER] `writeFileSync` is not imported in pick-repo.ts.
+
+   Step 6 uses `writeFileSync(logPath, "", { flag: "a" })` to touch the log
+   file. pick-repo.ts currently imports `{ readFile, appendFile }` from
+   `node:fs/promises` -- no sync fs imports at all. This is a ReferenceError.
+
+   Fix: Import `writeFileSync` from `node:fs`, or use the already-imported
+   async `appendFile` with an empty string (same effect, matches existing
+   code style).
+
+
+4. [RISK] Race condition: log terminal opens before daemon writes anything.
+
+   Step 6 orders operations as: (a) touch log file, (b) open log terminal
+   via URI, (c) start daemon. The `tail -F` will open on an empty file. This
+   is technically fine (`tail -F` waits for content), but the user sees a
+   blank terminal for several seconds until the daemon starts and writes
+   its session header. On daemon startup failure, the terminal stays blank
+   forever with no indication of an error.
+
+   Fix: Consider adding a "Waiting for daemon..." marker line when touching
+   the file, so the terminal is not completely blank. Or, start the daemon
+   first and open the terminal after the daemon socket is confirmed alive
+   (the existing poll loop already does this).
+
+
+5. [RISK] `code-insiders` excluded from URI scheme map -- no log terminal.
+
+   Step 4 sets `uriScheme` to `undefined` for `code-insiders`. Step 6 gates
+   log terminal opening on `ide.uriScheme` being truthy. Users running VS
+   Code Insiders will never get the log terminal. The plan does not explain
+   whether this is intentional.
+
+   The actual URI scheme for VS Code Insiders is `vscode-insiders`. If the
+   URI approach worked at all (see finding #1), the fix would be to add
+   `"code-insiders": "vscode-insiders"` to the map.
+
+   Fix: Either add the mapping or document the exclusion as intentional.
+
+
+6. [RISK] `getDaemonLogPath` uses `basename(repoRoot)` -- collision risk.
+
+   Two repos with the same directory name but different parent paths (e.g.,
+   `/home/user/projectA/app` and `/home/user/projectB/app`) would produce
+   the same log path: `app.daemon.log`. The existing socket path uses a
+   sha256 hash of the resolved realpath to avoid this exact problem.
+
+   Fix: Use the same hash strategy as `getSocketPath`, e.g.:
+   `${hash}.daemon.log` or `${basename}-${hash.slice(0,8)}.daemon.log`
+   for readability plus uniqueness.
+
+
+7. [RISK] Log pruning has no file-locking; concurrent prune + daemon append.
+
+   Step 2's `pruneLogFile` reads the entire file, filters lines, then
+   rewrites it. If the daemon is actively appending (via the Logger's
+   `appendFile`), a prune that fires at the same moment can truncate lines
+   the daemon just wrote. The plan calls prune "before the session header
+   write" in daemon.ts, meaning the daemon itself does the pruning. This
+   makes a same-process race unlikely for a single daemon, but if two
+   daemons for different repos share a log file due to the basename
+   collision in finding #6, data loss occurs.
+
+   Fix: At minimum, resolve finding #6. Additionally, consider writing to a
+   temp file and renaming (atomic on POSIX), or using `fs.open` with
+   exclusive flags.
+
+
+8. [RISK] Log pruning timestamp parser may miss Logger's actual format.
+
+   Step 2 parses `[YYYY-MM-DDTHH:mm:ss.sssZ]` from regular lines. But the
+   Logger (src/logger.ts line 34) writes:
+   `[${new Date().toISOString()}] [${type}] ${message}\n`
+
+   The ISO string from `toISOString()` produces `YYYY-MM-DDTHH:mm:ss.sssZ`,
+   which matches. However, the plan says "lines without any timestamp
+   context: keep (conservative)." If the regex is even slightly wrong (e.g.,
+   requiring exactly 3 decimal places when some runtimes emit fewer), old
+   lines accumulate forever.
+
+   Severity lowered because the plan includes tests for this. Verify the
+   regex is tested against the actual Logger output format.
+
+
+9. [NIT] Step 5 uses `btoa(encodeURIComponent(JSON.stringify(config)))`.
+
+   `btoa` is available in Node 16+ globally, and the project targets
+   ES2022, so this will work. However, `btoa` operates on Latin-1 strings.
+   The `encodeURIComponent` call first produces only ASCII, so this is safe.
+   But it is a fragile chain -- if someone removes the `encodeURIComponent`
+   wrapper later, non-ASCII repo names would produce incorrect base64.
+
+   Fix (optional): Use `Buffer.from(JSON.stringify(config)).toString("base64")`
+   which handles arbitrary strings correctly in Node.
+
+
+10. [NIT] Step 6 reorders pick-repo.ts significantly.
+
+    The plan says "move `detectIde()` up from bottom of file" and reorder
+    the daemon/IDE section. The current code (lines 128-165) handles daemon
+    startup, then (lines 206-220) handles IDE tasks and launch. The plan
+    interleaves IDE detection into the daemon section. This is a large
+    structural change that increases merge conflict risk with other in-flight
+    work. The plan does not justify why `detectIde()` must run before daemon
+    startup rather than just before the `openDaemonLogTerminal` call.
+
+    Fix (optional): Keep `detectIde()` where it is and just read its result
+    at the point of use, or extract the new logic into a helper function.
+
+
+11. [NIT] Daemon log path function placed in socket.ts.
+
+    `getDaemonLogPath` is a log-file concern, not a socket concern. Placing
+    it in socket.ts because it reuses `getSocketDir()` couples the modules.
+    A dedicated `src/paths.ts` or placing it in the new `src/log-pruning.ts`
+    would be more cohesive.
+
+
+================================================================
+SUMMARY VERDICT: CONDITIONAL
+================================================================
+
+Implement with fixes. Three blockers must be resolved first:
+
+(A) The `open.in-terminal` URI protocol is fictional or undocumented. The
+    entire Step 5 approach needs replacement. The codebase already has a
+    proven pattern: add a `tail -F` task to `.vscode/tasks.json` with
+    `runOn: "folderOpen"`. Use that instead.
+
+(B) Missing imports in pick-repo.ts (`basename`, `writeFileSync`) will
+    cause immediate runtime crashes.
+
+(C) The `basename`-only log path creates collision risk for same-named
+    repos. Use the existing hash strategy.
+
+If blocker (A) is resolved by switching to the tasks.json approach, then
+Steps 4 and 5 are eliminated entirely, and the plan simplifies to: add
+`getDaemonLogPath` (with hash), add log pruning, update daemon.ts header,
+and add a new "Daemon Log" task in `writeWorktreeTasksFile`.

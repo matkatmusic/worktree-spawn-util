@@ -3,7 +3,7 @@
 import { createHash } from "node:crypto";
 import { mkdirSync, unlinkSync, statSync } from "node:fs";
 import { realpath } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { createConnection } from "node:net";
 
 const SOCKET_DIR_PREFIX = "wtsu";
@@ -50,6 +50,17 @@ export async function getDaemonSessionName(repoRoot: string): Promise<string> {
   const resolved = await realpath(repoRoot);
   const hash = createHash("sha256").update(resolved).digest("hex").slice(0, 12);
   return `wtsu_daemon_${hash}`;
+}
+
+/**
+ * Get the per-repo daemon log file path.
+ * Uses basename + short hash for readability + uniqueness (same realpath strategy as getSocketPath).
+ */
+export async function getDaemonLogPath(repoRoot: string): Promise<string> {
+  const resolved = await realpath(repoRoot);
+  const hash = createHash("sha256").update(resolved).digest("hex").slice(0, 8);
+  const name = basename(resolved);
+  return join(getSocketDir(), `${name}-${hash}.daemon.log`);
 }
 
 /**

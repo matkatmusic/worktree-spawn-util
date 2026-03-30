@@ -1,0 +1,43 @@
+# Review of "Daemon Log Terminal in Parent IDE" Implementation Plan
+
+## 1. [BLOCKER] Non-standard URI Protocol (`open.in-terminal`)
+The plan assumes that `vscode://open.in-terminal` is a valid URI scheme for VS Code (Step 5). **This protocol does not exist in standard VS Code.** While Antigravity may support it, applying the `vscode` scheme to this path will result in an "Invalid URI" or "No application found" error for VS Code users. Without a specific extension installed in the parent IDE to handle this custom protocol, the feature will be completely non-functional.
+
+## 2. [BLOCKER] Missing Imports in `src/cli/pick-repo.ts`
+The integration steps in `pick-repo.ts` (Step 6) introduce several new dependencies that are not currently imported in that file:
+- `writeFileSync`: Used in Step 6.5 but `node:fs` is not imported (only `node:fs/promises`).
+- `basename`: Used in Step 6.6 but not imported from `node:path`.
+- `openDaemonLogTerminal`: Used in Step 6.6 but not added to the imports from `../ide.js`.
+
+## 3. [BLOCKER] Log File Collision Risk
+Step 1 uses `basename(repoRoot)` to name the log file: `${basename(repoRoot)}.daemon.log`. If a user has two different repositories with the same directory name (e.g., `/work/project-a/web` and `/home/project-b/web`), they will both attempt to write to `web.daemon.log`. This will cause interleaved and corrupted logs. 
+*   **Fix:** Use the same deterministic hash strategy used for socket paths in `src/socket.ts` (lines 35-40).
+
+## 4. [BLOCKER] Unquoted Log Path in Terminal Command
+In Step 5, the terminal command is defined as `tail -F {logPath}`. If the log path contains spaces (which is common in macOS paths like `/Users/Name/My Projects/...`), the `tail` command will fail because it will treat the path as multiple arguments.
+*   **Fix:** Wrap the path in quotes: `tail -F "{logPath}"`.
+
+## 5. [BLOCKER] Missing URI Encoding for Base64 Config
+The URI constructed in Step 5 (`...config={encoded}&encoded=1`) does not URI-encode the Base64 string. Base64 strings frequently contain `+`, `/`, and `=` characters. In a URI query parameter, `+` is interpreted as a space, and `=` is a delimiter, which will corrupt the Base64 data and cause decoding failures at the receiver.
+*   **Fix:** Use `encodeURIComponent(encoded)` when building the URI string.
+
+## 6. [RISK] Lack of Symlink Resolution in `getDaemonLogPath`
+Unlike `getSocketPath` and `getDaemonSessionName` (src/socket.ts, lines 35 & 46), the new `getDaemonLogPath` utility does not use `realpath`. If a user interacts with a repository via a symlink, the daemon might use a different log path than the one computed by the CLI, leading to an empty terminal window showing no logs.
+
+## 7. [RISK] Incomplete IDE Support (`code-insiders`)
+Step 4 explicitly leaves the `uriScheme` undefined for `code-insiders`. Since Step 6.6 checks for `ide.uriScheme`, users of VS Code Insiders will be excluded from this feature entirely. There is no technical reason to exclude them; the scheme `vscode-insiders` should be used.
+
+## 8. [RISK] Performance Impact of Sync Pruning
+Step 2 and 3 involve reading, parsing, and rewriting the entire log file synchronously during daemon startup. If a log file grows large, this will block the daemon process and could delay socket initialization. If it takes longer than 5 seconds, `pick-repo.ts` (lines 141-148) will issue a warning that the daemon socket is not ready.
+
+## 9. [RISK] Race Condition with `ensureSocketDir`
+Step 6.5 attempts to write to the log file before `ensureSocketDir()` is called (currently at line 118 of `pick-repo.ts`). If the socket directory (`/tmp/wtsu-<uid>`) does not yet exist, `writeFileSync` will throw an `ENOENT` error and crash the `pick-repo` process.
+
+## 10. [NIT] Redundant Double-Encoding
+The encoding strategy `btoa(encodeURIComponent(JSON.stringify(config)))` is unusual. `encodeURIComponent` is typically used to handle UTF-8 characters *after* Base64 encoding if needed, or to prepare a string for `btoa` in browser environments. Doing it *inside* the Base64 encoding makes the payload larger and requires the receiver to perform a non-standard double-decoding.
+
+---
+
+### Summary Verdict: **REJECT**
+
+The plan contains multiple critical errors (Blockers 1-5) that will cause runtime failures, crashes, or data corruption. Specifically, the use of a non-existent URI protocol for VS Code and the missing imports/quotes in the CLI scripts make the plan unimplementable in its current form. A redesign is required to address the URI protocol and path collision issues.

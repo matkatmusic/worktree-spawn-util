@@ -15,6 +15,7 @@ const execFileAsync = promisify(execFile);
 
 export type IdeConfig = {
   command: string;
+  uriScheme?: string;
 };
 
 /** Map macOS bundle identifiers to CLI commands. */
@@ -24,24 +25,32 @@ const IDE_BUNDLE_MAP: Record<string, string> = {
   "com.google.antigravity": "agy",
 };
 
+/** Map CLI commands to URI schemes for the open.in-terminal extension. */
+const IDE_URI_SCHEME_MAP: Record<string, string> = {
+  "code": "vscode",
+  "code-insiders": "vscode-insiders",
+  "agy": "antigravity",
+};
+
 /** Detect which IDE spawned this process by checking environment variables. */
 export function detectIde(): IdeConfig | null {
   // Primary: macOS bundle identifier (most reliable for VS Code forks)
   const bundleId = process.env.__CFBundleIdentifier;
   if (bundleId && bundleId in IDE_BUNDLE_MAP) {
-    return { command: IDE_BUNDLE_MAP[bundleId] };
+    const command = IDE_BUNDLE_MAP[bundleId];
+    return { command, uriScheme: IDE_URI_SCHEME_MAP[command] };
   }
 
   // Fallback: VSCODE_GIT_ASKPASS_NODE contains the app path
   const askpassNode = process.env.VSCODE_GIT_ASKPASS_NODE ?? "";
   if (askpassNode.includes("Visual Studio Code Insiders")) {
-    return { command: "code-insiders" };
+    return { command: "code-insiders", uriScheme: IDE_URI_SCHEME_MAP["code-insiders"] };
   }
   if (askpassNode.includes("Visual Studio Code")) {
-    return { command: "code" };
+    return { command: "code", uriScheme: IDE_URI_SCHEME_MAP["code"] };
   }
   if (askpassNode.includes("Antigravity")) {
-    return { command: "agy" };
+    return { command: "agy", uriScheme: IDE_URI_SCHEME_MAP["agy"] };
   }
 
   return null;
@@ -236,6 +245,36 @@ export async function reloadIdeWindow(bundleId: string, logger?: Logger): Promis
       `[ide] Could not reload IDE window automatically. Use Command Palette > "Developer: Reload Window"`,
     );
   }
+}
+
+/**
+ * Open a terminal in the parent IDE window that tails the daemon log file.
+ * Uses the "open.in-terminal" VS Code/Antigravity extension via URI scheme.
+ */
+export function openDaemonLogTerminal(
+  uriScheme: string,
+  logPath: string,
+  repoBasename: string,
+  logger?: Logger,
+): void {
+  const terminalConfig = {
+    command: `tail -F "${logPath}"`,
+    name: `Daemon Log \u2014 ${repoBasename}`,
+    color: "cyan",
+    autoFocus: false,
+  };
+
+  const encoded = Buffer.from(
+    encodeURIComponent(JSON.stringify(terminalConfig)),
+  ).toString("base64");
+  const uri = `${uriScheme}://open.in-terminal?config=${encoded}&encoded=1`;
+
+  const child = spawn("open", [uri], {
+    detached: true,
+    stdio: "ignore",
+  });
+  child.unref();
+  logger?.log(`[ide] Opened daemon log terminal via ${uriScheme}:// URI`);
 }
 
 /** Send a macOS system notification. */

@@ -4,9 +4,10 @@
 
 import { appendFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
-import { getSocketPath, getSocketDir, ensureSocketDir, cleanStaleSocket } from "../socket.js";
+import { getSocketPath, getSocketDir, ensureSocketDir, cleanStaleSocket, getDaemonLogPath } from "../socket.js";
 import { createDaemonServer } from "../daemon-server.js";
 import { Logger } from "../logger.js";
+import { pruneLogFile } from "../log-pruning.js";
 import { DAEMON_FLAG_SILENT, DAEMON_FLAG_HEARTBEAT_TIMEOUT, DAEMON_FLAG_CHECK_INTERVAL } from "../cli-flags.js";
 
 const args = process.argv.slice(2);
@@ -34,13 +35,16 @@ if (!cleaned) {
 }
 
 // --- Start server ---
-const logFile = join(getSocketDir(), "daemon.log");
+const logFile = await getDaemonLogPath(repoRoot);
 const logger = new Logger(logFile, { silent });
+
+// --- Prune old log entries (14-day retention) ---
+pruneLogFile(logFile, 14);
 
 // Write session header (sync, runs once at startup)
 try {
   appendFileSync(logFile,
-    `\n=== SESSION START ===\n` +
+    `\n=== SESSION START [${new Date().toISOString()}] ===\n` +
     `worktree: (pending first heartbeat)\n` +
     `launched: ${new Date().toISOString()}\n` +
     `repo: ${repoRoot}\n` +

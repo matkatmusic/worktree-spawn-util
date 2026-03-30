@@ -3,7 +3,7 @@ import { mkdtemp, rm, readFile, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawn, execFile } from "node:child_process";
-import { detectIde, launchIde, writeWorktreeTasksFile, reloadIdeWindow } from "../src/ide.js";
+import { detectIde, launchIde, writeWorktreeTasksFile, reloadIdeWindow, openDaemonLogTerminal } from "../src/ide.js";
 
 vi.mock("node:child_process", () => ({
   spawn: vi.fn(() => ({ unref: vi.fn() })),
@@ -26,35 +26,35 @@ describe("detectIde", () => {
 
   it("detects VS Code via __CFBundleIdentifier", () => {
     process.env.__CFBundleIdentifier = "com.microsoft.VSCode";
-    expect(detectIde()).toEqual({ command: "code" });
+    expect(detectIde()).toEqual({ command: "code", uriScheme: "vscode" });
   });
 
   it("detects VS Code Insiders via __CFBundleIdentifier", () => {
     process.env.__CFBundleIdentifier = "com.microsoft.VSCodeInsiders";
-    expect(detectIde()).toEqual({ command: "code-insiders" });
+    expect(detectIde()).toEqual({ command: "code-insiders", uriScheme: "vscode-insiders" });
   });
 
   it("detects Antigravity via __CFBundleIdentifier", () => {
     process.env.__CFBundleIdentifier = "com.google.antigravity";
-    expect(detectIde()).toEqual({ command: "agy" });
+    expect(detectIde()).toEqual({ command: "agy", uriScheme: "antigravity" });
   });
 
   it("falls back to VSCODE_GIT_ASKPASS_NODE for VS Code", () => {
     process.env.VSCODE_GIT_ASKPASS_NODE =
       "/Applications/Visual Studio Code.app/Contents/MacOS/Electron";
-    expect(detectIde()).toEqual({ command: "code" });
+    expect(detectIde()).toEqual({ command: "code", uriScheme: "vscode" });
   });
 
   it("falls back to VSCODE_GIT_ASKPASS_NODE for VS Code Insiders", () => {
     process.env.VSCODE_GIT_ASKPASS_NODE =
       "/Applications/Visual Studio Code Insiders.app/Contents/MacOS/Electron";
-    expect(detectIde()).toEqual({ command: "code-insiders" });
+    expect(detectIde()).toEqual({ command: "code-insiders", uriScheme: "vscode-insiders" });
   });
 
   it("falls back to VSCODE_GIT_ASKPASS_NODE for Antigravity", () => {
     process.env.VSCODE_GIT_ASKPASS_NODE =
       "/Applications/Antigravity.app/Contents/MacOS/Electron";
-    expect(detectIde()).toEqual({ command: "agy" });
+    expect(detectIde()).toEqual({ command: "agy", uriScheme: "antigravity" });
   });
 
   it("returns null when no IDE env vars are set", () => {
@@ -70,7 +70,7 @@ describe("detectIde", () => {
     process.env.__CFBundleIdentifier = "com.google.antigravity";
     process.env.VSCODE_GIT_ASKPASS_NODE =
       "/Applications/Visual Studio Code.app/Contents/MacOS/Electron";
-    expect(detectIde()).toEqual({ command: "agy" });
+    expect(detectIde()).toEqual({ command: "agy", uriScheme: "antigravity" });
   });
 });
 
@@ -265,5 +265,62 @@ describe("reloadIdeWindow", () => {
 
     // Should not throw
     await expect(reloadIdeWindow("com.microsoft.VSCode")).resolves.toBeUndefined();
+  });
+});
+
+describe("openDaemonLogTerminal", () => {
+  beforeEach(() => {
+    mockSpawn.mockClear();
+  });
+
+  it("spawns 'open' with the correct vscode URI", () => {
+    const mockUnref = vi.fn();
+    mockSpawn.mockReturnValueOnce({ unref: mockUnref } as never);
+
+    openDaemonLogTerminal("vscode", "/tmp/wtsu-501/myrepo-abc12345.daemon.log", "myrepo");
+
+    expect(mockSpawn).toHaveBeenCalledWith(
+      "open",
+      [expect.stringContaining("vscode://open.in-terminal?config=")],
+      { detached: true, stdio: "ignore" },
+    );
+    expect(mockUnref).toHaveBeenCalled();
+  });
+
+  it("spawns with antigravity URI when scheme is antigravity", () => {
+    const mockUnref = vi.fn();
+    mockSpawn.mockReturnValueOnce({ unref: mockUnref } as never);
+
+    openDaemonLogTerminal("antigravity", "/tmp/wtsu-501/myrepo-abc12345.daemon.log", "myrepo");
+
+    const uri = mockSpawn.mock.calls[0][1][0] as string;
+    expect(uri).toMatch(/^antigravity:\/\/open\.in-terminal\?config=.+&encoded=1$/);
+  });
+
+  it("encodes config with correct fields and quoted path", () => {
+    const mockUnref = vi.fn();
+    mockSpawn.mockReturnValueOnce({ unref: mockUnref } as never);
+
+    openDaemonLogTerminal("vscode", "/tmp/wtsu-501/myrepo-abc12345.daemon.log", "myrepo");
+
+    const uri = mockSpawn.mock.calls[0][1][0] as string;
+    const configParam = uri.split("config=")[1].split("&")[0];
+    const decoded = JSON.parse(decodeURIComponent(Buffer.from(configParam, "base64").toString()));
+
+    expect(decoded.command).toContain("tail -F");
+    expect(decoded.command).toContain("myrepo-abc12345.daemon.log");
+    expect(decoded.name).toContain("myrepo");
+    expect(decoded.color).toBe("cyan");
+    expect(decoded.autoFocus).toBe(false);
+  });
+
+  it("spawns with vscode-insiders URI", () => {
+    const mockUnref = vi.fn();
+    mockSpawn.mockReturnValueOnce({ unref: mockUnref } as never);
+
+    openDaemonLogTerminal("vscode-insiders", "/tmp/wtsu-501/myrepo-abc12345.daemon.log", "myrepo");
+
+    const uri = mockSpawn.mock.calls[0][1][0] as string;
+    expect(uri).toMatch(/^vscode-insiders:\/\/open\.in-terminal/);
   });
 });

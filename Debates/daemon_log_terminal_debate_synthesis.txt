@@ -1,0 +1,106 @@
+DEBATE SYNTHESIS: "Daemon Log Terminal in Parent IDE" Plan Review
+Date: 2026-03-30
+Participants: Claude/Opus 4.6, Codex/GPT-5.4, Gemini 3.1 Pro
+
+================================================================
+VERDICTS
+================================================================
+  Claude:  CONDITIONAL (implement with fixes)
+  Codex:   REJECT (needs redesign)
+  Gemini:  REJECT (needs redesign)
+
+  Consensus: CONDITIONAL — implement with fixes (7 blockers remain).
+
+  NOTE: All 3 agents flagged `open.in-terminal` as fictional/non-built-in.
+  User confirms extension is installed and verified working. Removed as blocker.
+
+================================================================
+UNANIMOUS FINDINGS (all 3 agents agree)
+================================================================
+
+1. [BLOCKER] `basename(repoRoot)` log path collides for same-named repos.
+   Existing socket/session identity uses realpath + sha256 hash.
+   Log paths must follow the same strategy.
+   -> Fix: `${basename}-${hash.slice(0,8)}.daemon.log` for readability+uniqueness.
+
+3. [BLOCKER] Missing imports in pick-repo.ts.
+   `basename` (node:path) and `writeFileSync` (node:fs) are used but never imported.
+   Runtime ReferenceError on every invocation.
+
+4. [BLOCKER] `code-insiders` excluded from URI scheme map.
+   No justification given. Silently disables feature for a supported IDE.
+   -> Fix: add `"code-insiders": "vscode-insiders"` to the map.
+
+================================================================
+MAJORITY FINDINGS (2 of 3 agents agree)
+================================================================
+
+5. [BLOCKER] `ensureSocketDir()` ordering — first-run ENOENT crash.
+   (Codex, Gemini) Step 6 touches the log file before socket dir exists.
+   `ensureSocketDir()` only runs inside `!daemonAlive` branch, after the touch.
+   -> Fix: call ensureSocketDir() before touching the log file.
+
+6. [BLOCKER] Unquoted log path in `tail -F` command.
+   (Codex, Gemini) Repo names with spaces or shell metacharacters break the
+   tail command. `validateRepo()` does not sanitize basenames.
+   -> Fix: quote the path in the command string.
+
+7. [BLOCKER] Heartbeat CLI still writes to global daemon.log.
+   (Codex — unique but critical) src/cli/heartbeat.ts:25 hardcodes
+   `join(getSocketDir(), "daemon.log")`. Plan only updates daemon.ts,
+   so the tail terminal misses all heartbeat output.
+   -> Fix: heartbeat.ts must also use getDaemonLogPath(repoRoot).
+
+8. [BLOCKER] Existing tests break on uriScheme addition.
+   (Codex, partially Claude) detectIde() tests use exact object equality.
+   Adding uriScheme changes the shape. Plan mentions updating test
+   expectations but the provided test code is incomplete.
+
+================================================================
+SINGLE-AGENT FINDINGS (notable unique catches)
+================================================================
+
+9.  [RISK] Terminal only opens on first daemon start, not subsequent runs.
+    (Codex) Daemon is long-lived; later pick-repo invocations skip the
+    terminal open. Feature goal is partially unmet.
+
+10. [RISK] Race: blank terminal before daemon writes anything.
+    (Claude) tail -F on an empty file works but shows nothing for seconds.
+    On daemon startup failure, terminal stays blank forever.
+    -> Fix: write a "Waiting for daemon..." marker when touching the file.
+
+11. [RISK] Log pruning: no file-locking, read-filter-rewrite is not atomic.
+    (Claude) Low risk if basename collision is fixed (single daemon per file).
+    -> Fix: write to temp file + rename for atomic replacement.
+
+12. [RISK] Missing realpath/symlink resolution in getDaemonLogPath.
+    (Gemini) Symlinked repo paths produce different log identities vs socket paths.
+
+13. [RISK] Sync pruning blocks daemon startup; may trigger socket-ready timeout.
+    (Gemini) pick-repo.ts warns if daemon socket isn't ready within 5s.
+
+14. [NIT] btoa(encodeURIComponent(...)) encoding chain is fragile.
+    (Claude, Gemini) Use Buffer.from().toString("base64") instead.
+
+15. [NIT] getDaemonLogPath placed in socket.ts is a cohesion concern.
+    (Claude) Consider src/log-pruning.ts or src/paths.ts.
+
+================================================================
+REQUIRED FIXES BEFORE IMPLEMENTATION
+================================================================
+
+Keep the URI-based open.in-terminal approach (user confirms extension is
+installed and working). Fix these before implementing:
+
+  1. getDaemonLogPath — use hash strategy matching getSocketPath, add realpath
+  2. Add missing imports in pick-repo.ts: basename, writeFileSync
+  3. Add "code-insiders": "vscode-insiders" to IDE_URI_SCHEME_MAP
+  4. Call ensureSocketDir() before touching the log file
+  5. Quote logPath in the tail -F command string
+  6. heartbeat.ts — also switch to per-repo log path (getDaemonLogPath)
+  7. Update all detectIde() test expectations for new uriScheme field
+  8. log-pruning.ts — consider atomic write (temp file + rename)
+
+Total blockers: 7 (3 unanimous, 4 majority/unique)
+Total risks: 5
+Total nits: 2
