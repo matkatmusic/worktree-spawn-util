@@ -1,7 +1,7 @@
 // daemon/server — core daemon logic extracted for testability
 
 import { createServer, type Server, type Socket } from "node:net";
-import { unlinkSync } from "node:fs";
+import { unlinkSync, existsSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -175,7 +175,8 @@ export function createDaemonServer(
               if (active) {
                 active.lastHeartbeat = Date.now();
               } else {
-                heartbeats.set(msg.worktree, { lastHeartbeat: Date.now(), parentBranch: "", parentCommit: "" });
+                // Unknown worktree — no pending registration, no active entry. Ignore it.
+                logger?.log(`[daemon] Ignoring heartbeat for unknown worktree "${msg.worktree}"`);
               }
             }
             lastActivityTime = Date.now();
@@ -217,6 +218,17 @@ export function createDaemonServer(
     for (const { name, state } of expired) {
       heartbeats.delete(name);
       await cleanupWorktree(name, state);
+      // If the worktree was preserved (not deleted), re-insert the entry
+      // so it continues to be tracked with its original parent info.
+      const worktreePath = join(repoRoot, ".worktrees", name);
+      if (existsSync(worktreePath) && !heartbeats.has(name)) {
+        heartbeats.set(name, {
+          lastHeartbeat: Date.now(),
+          parentBranch: state.parentBranch,
+          parentCommit: state.parentCommit,
+        });
+        logger?.log(`[daemon] Re-inserted preserved worktree "${name}" into tracking`);
+      }
     }
 
     if (heartbeats.size === 0 && pendingRegistrations.size === 0 && now - lastActivityTime > cfg.idleShutdownMs) {
