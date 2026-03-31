@@ -2,7 +2,7 @@
 
 import { execFile, spawn } from "node:child_process";
 import { readFile, appendFile } from "node:fs/promises";
-import { writeFileSync } from "node:fs";
+import { writeFileSync, existsSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { createConnection } from "node:net";
 import { fileURLToPath } from "node:url";
@@ -53,6 +53,7 @@ async function pickFolder(): Promise<string | null> {
 const cliArgs = process.argv.slice(2);
 const visible = cliArgs.includes(PICK_REPO_FLAG_INSPECT_HB);
 const forcePick = cliArgs.includes(PICK_REPO_FLAG_PICK);
+const rawInput = cliArgs.filter((a) => !a.startsWith("--")).join(" ");
 const rawName = cliArgs.filter((a) => !a.startsWith("--")).join("_");
 
 if (!rawName.trim()) {
@@ -113,6 +114,10 @@ try {
   logger.warn("[pick-repo] Could not determine parent branch/commit");
 }
 
+// --- Check if worktree folder already exists (before creating) ---
+const expectedWorktreePath = join(selection.repoRoot, ".worktrees", worktreeName);
+const worktreeExisted = existsSync(expectedWorktreePath);
+
 // --- Create worktree ---
 let worktreePath: string;
 try {
@@ -124,6 +129,15 @@ try {
   const message = err instanceof Error ? err.message : String(err);
   logger.error(`[pick-repo] Failed to create worktree: ${message}`);
   process.exit(1);
+}
+
+// --- Initialize submodules in worktree ---
+try {
+  await execFileAsync("git", ["-C", worktreePath, "submodule", "update", "--init", "--recursive"]);
+  logger.log(`[pick-repo] Submodules initialized in worktree`);
+} catch (err: unknown) {
+  const message = err instanceof Error ? err.message : String(err);
+  logger.warn(`[pick-repo] Could not initialize submodules: ${message}`);
 }
 
 // --- Detect IDE early (before daemon start, so we can open terminal in parent window) ---
@@ -230,8 +244,13 @@ try {
 // --- Send initial commands to Claude pane ---
 if (sessionIsNew) {
   await sleep(3000);
-  await execFileAsync("tmux", ["send-keys", "-t", paneTarget, `/rename ${worktreeName}`, "Enter"]);
-  logger.log(`[pick-repo] Sent /rename to Claude`);
+  if (worktreeExisted) {
+    await execFileAsync("tmux", ["send-keys", "-t", paneTarget, `/resume ${worktreeName}`, "Enter"]);
+    logger.log(`[pick-repo] Sent /resume to Claude`);
+  } else {
+    await execFileAsync("tmux", ["send-keys", "-t", paneTarget, `/rename ${worktreeName}`, "Enter"]);
+    logger.log(`[pick-repo] Sent /rename to Claude`);
+  }
 }
 
 await sleep(500);
@@ -239,7 +258,9 @@ await execFileAsync("tmux", ["send-keys", "-t", paneTarget, "/context-mode", "En
 logger.log(`[pick-repo] Sent /context-mode to Claude`);
 
 await sleep(500);
-const grillCmd = `/grill-me about ${rawName.trim()}`;
+const grillCmd = worktreeExisted
+  ? `/grill-me continue where we left off. Check git history, ~/.claude/conversations/, and ~/.claude/plans/ for previous conversations associated with the worktree '${rawInput.trim()}'`
+  : `/grill-me about '${rawInput.trim()}'`;
 await execFileAsync("tmux", ["send-keys", "-t", paneTarget, grillCmd, "Enter"]);
 logger.log(`[pick-repo] Sent /grill-me to Claude`);
 
