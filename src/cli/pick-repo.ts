@@ -199,28 +199,49 @@ if (parentBranch && parentCommit) {
   });
 }
 
-// --- Create worktree tmux session (Claude top, terminal bottom) ---
+// --- Create or resume worktree tmux session ---
+const paneTarget = `${worktreeName}:0.0`;
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+let sessionIsNew = false;
+
 try {
-  await execFileAsync("tmux", [
-    "new-session", "-d", "-s", worktreeName, "-c", worktreePath,
-    "zsh", "-c", "source ~/.claude/init.sh && claude --permission-mode plan",
-  ]);
-  await execFileAsync("tmux", [
-    "split-window", "-v", "-t", worktreeName, "-c", worktreePath,
-  ]);
-  await execFileAsync("tmux", [
-    "select-pane", "-t", `${worktreeName}:0.0`,
-  ]);
-  // Wait for Claude to initialize, then rename the conversation
-  await new Promise((resolve) => setTimeout(resolve, 3000));
-  await execFileAsync("tmux", [
-    "send-keys", "-t", `${worktreeName}:0.0`,
-    `/rename ${worktreeName}`, "Enter",
-  ]);
-  logger.log(`[pick-repo] Created tmux session "${worktreeName}" with Claude + terminal`);
+  await execFileAsync("tmux", ["has-session", "-t", worktreeName]);
+  logger.log(`[pick-repo] Tmux session "${worktreeName}" exists — resuming`);
 } catch {
-  logger.log(`[pick-repo] Could not create tmux session (may already exist)`);
+  try {
+    await execFileAsync("tmux", [
+      "new-session", "-d", "-s", worktreeName, "-c", worktreePath,
+      "zsh", "-c", "unset NODE_OPTIONS; source ~/.claude/init.sh && claude --permission-mode plan",
+    ]);
+    await execFileAsync("tmux", [
+      "split-window", "-v", "-t", worktreeName, "-c", worktreePath,
+      "zsh", "-c", "unset NODE_OPTIONS; exec zsh",
+    ]);
+    await execFileAsync("tmux", [
+      "select-pane", "-t", paneTarget,
+    ]);
+    sessionIsNew = true;
+    logger.log(`[pick-repo] Created tmux session "${worktreeName}" with Claude + terminal`);
+  } catch {
+    logger.log(`[pick-repo] Could not create tmux session`);
+  }
 }
+
+// --- Send initial commands to Claude pane ---
+if (sessionIsNew) {
+  await sleep(3000);
+  await execFileAsync("tmux", ["send-keys", "-t", paneTarget, `/rename ${worktreeName}`, "Enter"]);
+  logger.log(`[pick-repo] Sent /rename to Claude`);
+}
+
+await sleep(500);
+await execFileAsync("tmux", ["send-keys", "-t", paneTarget, "/context-mode", "Enter"]);
+logger.log(`[pick-repo] Sent /context-mode to Claude`);
+
+await sleep(500);
+const grillCmd = `/grill-me about ${rawName.trim()}`;
+await execFileAsync("tmux", ["send-keys", "-t", paneTarget, grillCmd, "Enter"]);
+logger.log(`[pick-repo] Sent /grill-me to Claude`);
 
 // --- Set up worktree IDE config ---
 const tasksStatus = await writeWorktreeTasksFile(worktreePath, worktreeName, selection.repoRoot, visible, logger);

@@ -1,0 +1,5 @@
+2026-03-31 — initial_commands session
+
+When the worktree window is opened, 2 commands should be sent into claude: turning on context-mode via the '/context-mode' skill, and then sending '/grill-me about <branch-name>' after context mode finishes loading.
+
+Additional requirement: If the worktree already exists when opening the IDE window, don't rename the claude convo — instead, resume the convo. Send /context-mode and /grill-me on both new and resumed sessions.
