@@ -53,23 +53,23 @@ async function pickFolder(): Promise<string | null> {
 const cliArgs = process.argv.slice(2);
 const visible = cliArgs.includes(PICK_REPO_FLAG_INSPECT_HB);
 const forcePick = cliArgs.includes(PICK_REPO_FLAG_PICK);
-const rawInput = cliArgs.filter((a) => !a.startsWith("--")).join(" ");
-const rawName = cliArgs.filter((a) => !a.startsWith("--")).join("_");
+const userInput = cliArgs.filter((a) => !a.startsWith("--")).join(" ");
+const userInputWithSpacesReplaced = cliArgs.filter((a) => !a.startsWith("--")).join("_");
 
-if (!rawName.trim()) {
+if (!userInputWithSpacesReplaced.trim()) {
   logger.error("[pick-repo] No worktree name provided.");
   process.exit(1);
 }
 
-const worktreeName = sanitizeWorktreeName(rawName.trim());
+const worktreeName = sanitizeWorktreeName(userInputWithSpacesReplaced.trim());
 
 if (!worktreeName) {
   logger.error("[pick-repo] Worktree name is empty after sanitization.");
   process.exit(1);
 }
 
-if (worktreeName !== rawName.trim()) {
-  logger.log(`[pick-repo] Sanitized name: "${rawName.trim()}" -> "${worktreeName}"`);
+if (worktreeName !== userInputWithSpacesReplaced.trim()) {
+  logger.log(`[pick-repo] Sanitized name: "${userInputWithSpacesReplaced.trim()}" -> "${worktreeName}"`);
 }
 
 // --- Repo picker (auto-detect submodule parent or prompt) ---
@@ -259,8 +259,8 @@ logger.log(`[pick-repo] Sent /context-mode to Claude`);
 
 await sleep(500);
 const grillCmd = worktreeExisted
-  ? `/grill-me continue where we left off. Check git history, ~/.claude/conversations/, and ~/.claude/plans/ for previous conversations associated with the worktree '${rawInput.trim()}'`
-  : `/grill-me about '${rawInput.trim()}'`;
+  ? `/grill-me continue where we left off. Check git history, ~/.claude/conversations/, and ~/.claude/plans/ for previous conversations associated with the worktree '${worktreeName.trim()}'`
+  : `/grill-me about '${userInput.trim()}'`;
 await execFileAsync("tmux", ["send-keys", "-t", paneTarget, grillCmd, "Enter"]);
 logger.log(`[pick-repo] Sent /grill-me to Claude`);
 
