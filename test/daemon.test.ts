@@ -53,12 +53,20 @@ describe("createDaemonServer", () => {
       handle!.events.on("listening", resolve);
     });
 
-    // Send a heartbeat
+    // Register first, then send heartbeat
+    await new Promise<void>((resolve) => {
+      const client = createConnection({ path: socketPath }, () => {
+        client.write(JSON.stringify({ type: "register", worktree: "my-feature", parentBranch: "main", parentCommit: "abc123" }) + "\n", () => {
+          client.end();
+          setTimeout(resolve, 50);
+        });
+      });
+    });
+
     await new Promise<void>((resolve) => {
       const client = createConnection({ path: socketPath }, () => {
         client.write(JSON.stringify({ type: "heartbeat", worktree: "my-feature" }) + "\n", () => {
           client.end();
-          // Brief delay for server to process
           setTimeout(resolve, 50);
         });
       });
@@ -74,8 +82,16 @@ describe("createDaemonServer", () => {
       handle!.events.on("listening", resolve);
     });
 
-    // Send heartbeats for two worktrees
+    // Register then send heartbeats for two worktrees
     for (const name of ["feat-a", "feat-b"]) {
+      await new Promise<void>((resolve) => {
+        const client = createConnection({ path: socketPath }, () => {
+          client.write(JSON.stringify({ type: "register", worktree: name, parentBranch: "main", parentCommit: "abc123" }) + "\n", () => {
+            client.end();
+            setTimeout(resolve, 50);
+          });
+        });
+      });
       await new Promise<void>((resolve) => {
         const client = createConnection({ path: socketPath }, () => {
           client.write(JSON.stringify({ type: "heartbeat", worktree: name }) + "\n", () => {
@@ -101,7 +117,16 @@ describe("createDaemonServer", () => {
       handle!.events.on("listening", resolve);
     });
 
-    // Send one heartbeat
+    // Register then send one heartbeat
+    await new Promise<void>((resolve) => {
+      const client = createConnection({ path: socketPath }, () => {
+        client.write(JSON.stringify({ type: "register", worktree: "expiring", parentBranch: "main", parentCommit: "abc123" }) + "\n", () => {
+          client.end();
+          setTimeout(resolve, 50);
+        });
+      });
+    });
+
     await new Promise<void>((resolve) => {
       const client = createConnection({ path: socketPath }, () => {
         client.write(JSON.stringify({ type: "heartbeat", worktree: "expiring" }) + "\n", () => {

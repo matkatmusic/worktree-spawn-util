@@ -1,7 +1,7 @@
 // daemon/server — core daemon logic extracted for testability
 
 import { createServer, type Server, type Socket } from "node:net";
-import { unlinkSync, existsSync } from "node:fs";
+import { unlinkSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -206,8 +206,23 @@ export function createDaemonServer(
     events.emit("error", err);
   });
 
+  let lastCheckTime = Date.now();
+
   const checkInterval = setInterval(async () => {
     const now = Date.now();
+    const elapsed = now - lastCheckTime;
+    lastCheckTime = now;
+
+    // Sleep detection: if elapsed time far exceeds check interval, system slept.
+    // Reset heartbeat timestamps so worktrees aren't punished for system sleep.
+    if (elapsed > cfg.checkIntervalMs * 3) {
+      logger?.log(`[daemon] Sleep detected (${Math.round(elapsed / 1000)}s gap) — resetting heartbeat timestamps`);
+      for (const [, state] of heartbeats) {
+        state.lastHeartbeat = now;
+      }
+      lastActivityTime = now;
+      return;
+    }
 
     const expired: Array<{ name: string; state: WorktreeState }> = [];
     for (const [worktree, state] of heartbeats) {
@@ -218,17 +233,6 @@ export function createDaemonServer(
     for (const { name, state } of expired) {
       heartbeats.delete(name);
       await cleanupWorktree(name, state);
-      // If the worktree was preserved (not deleted), re-insert the entry
-      // so it continues to be tracked with its original parent info.
-      const worktreePath = join(repoRoot, ".worktrees", name);
-      if (existsSync(worktreePath) && !heartbeats.has(name)) {
-        heartbeats.set(name, {
-          lastHeartbeat: Date.now(),
-          parentBranch: state.parentBranch,
-          parentCommit: state.parentCommit,
-        });
-        logger?.log(`[daemon] Re-inserted preserved worktree "${name}" into tracking`);
-      }
     }
 
     if (heartbeats.size === 0 && pendingRegistrations.size === 0 && now - lastActivityTime > cfg.idleShutdownMs) {

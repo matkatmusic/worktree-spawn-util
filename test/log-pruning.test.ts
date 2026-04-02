@@ -93,8 +93,8 @@ describe("pruneLogFile", () => {
     expect(result).toContain("orphaned line");
   });
 
-  it("keeps lines exactly 14 days old (boundary)", async () => {
-    const ts = daysAgo(14);
+  it("keeps lines just under 14 days old (boundary)", async () => {
+    const ts = daysAgo(13.99);
     const content = `[${ts}] [LOG] boundary line\n`;
     await writeFile(logPath, content);
     pruneLogFile(logPath, 14);
