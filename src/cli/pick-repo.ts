@@ -53,23 +53,24 @@ async function pickFolder(): Promise<string | null> {
 const cliArgs = process.argv.slice(2);
 const visible = cliArgs.includes(PICK_REPO_FLAG_INSPECT_HB);
 const forcePick = cliArgs.includes(PICK_REPO_FLAG_PICK);
-const userInput = cliArgs.filter((a) => !a.startsWith("--")).join(" ");
-const userInputWithSpacesReplaced = cliArgs.filter((a) => !a.startsWith("--")).join("_");
+const positionalArgs = cliArgs.filter((a) => !a.startsWith("--"));
+const unsanitizedWorktreeName = positionalArgs[0] || "";
+const grillArg = positionalArgs.slice(1).join(" ");
 
-if (!userInputWithSpacesReplaced.trim()) {
+if (!unsanitizedWorktreeName.trim()) {
   logger.error("[pick-repo] No worktree name provided.");
   process.exit(1);
 }
 
-const worktreeName = sanitizeWorktreeName(userInputWithSpacesReplaced.trim());
+const worktreeName = sanitizeWorktreeName(unsanitizedWorktreeName.trim());
 
 if (!worktreeName) {
   logger.error("[pick-repo] Worktree name is empty after sanitization.");
   process.exit(1);
 }
 
-if (worktreeName !== userInputWithSpacesReplaced.trim()) {
-  logger.log(`[pick-repo] Sanitized name: "${userInputWithSpacesReplaced.trim()}" -> "${worktreeName}"`);
+if (worktreeName !== unsanitizedWorktreeName.trim()) {
+  logger.log(`[pick-repo] Sanitized name: "${unsanitizedWorktreeName.trim()}" -> "${worktreeName}"`);
 }
 
 // --- Repo picker (auto-detect submodule parent or prompt) ---
@@ -254,13 +255,14 @@ if (sessionIsNew) {
 }
 
 await sleep(500);
-await execFileAsync("tmux", ["send-keys", "-t", paneTarget, "/context-mode", "Enter"]);
-logger.log(`[pick-repo] Sent /context-mode to Claude`);
-
-await sleep(500);
-const grillCmd = worktreeExisted
-  ? `/grill-me continue where we left off. Check git history, ~/.claude/conversations/, and ~/.claude/plans/ for previous conversations associated with the worktree '${worktreeName.trim()}'`
-  : `/grill-me about '${userInput.trim()}'`;
+let grillCmd: string;
+if (worktreeExisted) {
+  grillCmd = `/grill-me continue where we left off. Check git history, ~/.claude/conversations/, and ~/.claude/plans/ for previous conversations associated with the worktree '${worktreeName.trim()}'`;
+} else if (grillArg.trim()) {
+  grillCmd = grillArg.trim();
+} else {
+  grillCmd = `/grill-me about '${unsanitizedWorktreeName.trim()}'`;
+}
 await execFileAsync("tmux", ["send-keys", "-t", paneTarget, grillCmd, "Enter"]);
 logger.log(`[pick-repo] Sent /grill-me to Claude`);
 

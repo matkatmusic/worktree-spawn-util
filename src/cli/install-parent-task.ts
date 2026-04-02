@@ -14,10 +14,12 @@ import {
 } from "../cli-flags.js";
 
 const TASK_LABEL = "Worktree: Pick Repository";
-const INPUT_ID = "worktreeName";
+const WORKTREE_NAME_ID = "worktreeName";
+const GRILL_ME_ID = "grillMePrompt";
 
 function taskCommand(): string {
-  return `npm run build && node dist/cli/pick-repo.js \${input:${INPUT_ID}}`;
+  return `npm run build && node dist/cli/pick-repo.js "\${input:${WORKTREE_NAME_ID}}" "\${input:${GRILL_ME_ID}}"`;
+
 }
 
 function buildUsageComment(indent: string): string {
@@ -99,11 +101,18 @@ async function main() {
   });
 
   // Inject worktreeName input if missing
-  if (!tasksJson.inputs!.some((i) => i.id === INPUT_ID)) {
+  if (!tasksJson.inputs!.some((i) => i.id === WORKTREE_NAME_ID)) {
     tasksJson.inputs!.push({
-      id: INPUT_ID,
+      id: WORKTREE_NAME_ID,
       type: "promptString",
       description: "Worktree name",
+    });
+  }
+  if (!tasksJson.inputs!.some((i) => i.id === GRILL_ME_ID)) {
+    tasksJson.inputs!.push({
+      id: GRILL_ME_ID,
+      type: "promptString",
+      description: "Describe what this worktree is focused on",
     });
   }
 
