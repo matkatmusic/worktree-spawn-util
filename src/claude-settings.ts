@@ -19,6 +19,7 @@ const DEFAULT_WORKTREE_PERMISSIONS: string[] = [
   "mcp__plugin_context-mode_context-mode__ctx_execute_file",
   "mcp__plugin_context-mode_context-mode__ctx_search",
   "mcp__plugin_context-mode_context-mode__ctx_execute",
+  "mcp__plugin_context-mode_context-mode__ctx_stats",
   "WebSearch",
   "Bash(npm run:*)",
   "Bash(npx tsc:*)",
@@ -28,7 +29,10 @@ const DEFAULT_WORKTREE_PERMISSIONS: string[] = [
   "Bash(tmux list-panes:*)",
   "Bash(git add:*)",
   "Bash(git fetch:*)",
-  "Bash(git rebase:*)"
+  "Bash(git rebase:*)",
+  "Bash(npx vitest:*)",
+  "Bash(git stash:*)",
+  "Bash(git commit:*)"
 ];
 
 /**
